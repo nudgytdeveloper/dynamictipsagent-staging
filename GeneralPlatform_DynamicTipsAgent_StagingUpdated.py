@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Tuple
 import os 
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.core import CORSMiddleware 
+from fastapi.middleware.cors import CORSMiddleware 
 from pydantic import BaseModel 
 
 MONGO_URI              = os.environ.get("MONGO_URI")
