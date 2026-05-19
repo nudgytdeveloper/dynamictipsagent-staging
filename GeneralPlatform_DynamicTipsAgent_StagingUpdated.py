@@ -208,6 +208,24 @@ def get_tips_by_id(simulation_id: str):
  
     return result
 
+@app.get("/debug/raw/{simulation_id}")
+def debug_raw(simulation_id: str):
+    from bson import ObjectId
+
+    results = {}
+
+    count_string = transcripts_collection.count_documents({"simulation": simulation_id})
+    results["match_as_string"] = count_string 
+
+    try:
+        oid = ObjectId(simulation_id)
+        count_oid = transcripts_collection.count_documents({"simulation": oid})
+        results["match_as_objectid"] = count_oid 
+    except Exception as e:
+        results["objectid_error"] = str(e)
+    
+    return results 
+
 if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))  # fallback to 8000 locally
