@@ -1,7 +1,8 @@
 import pymongo
 import google.generativeai as genai
 from datetime import datetime 
-from typing import List, Dict, Any, Tuple 
+from typing import List, Dict, Any, Tuple
+import os 
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.core import CORSMiddleware 
