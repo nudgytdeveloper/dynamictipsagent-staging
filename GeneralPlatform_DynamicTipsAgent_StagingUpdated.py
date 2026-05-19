@@ -174,20 +174,20 @@ def health_check():
  
 @app.post("/tips", response_model=TipsResponse)
 def get_tips(request: TipsRequest):
-    """
-    Trigger tip generation for a simulation.
-    Called when the user clicks the 'Get Tips' button.
-    """
-    if not request.simulation_id:
-        raise HTTPException(status_code=400, detail="simulation_id is required.")
- 
-    result = advisor.process_simulation(request.simulation_id)
- 
-    # Surface Gemini errors as 502 so the caller knows it's upstream
-    if result.get("error") and not result.get("tips"):
-        raise HTTPException(status_code=502, detail=result["error"])
- 
-    return result
+    try:
+        if not request.simulation_id:
+            raise HTTPException(status_code=400, detail="simulation_id is required.")
+        
+        result = advisor.process_simulation(request.simulation_id)
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # This logs the full traceback to Render logs instead of crashing
+        import traceback
+        print(f"UNHANDLED ERROR: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
  
  
 @app.get("/tips/{simulation_id}", response_model=TipsResponse)
