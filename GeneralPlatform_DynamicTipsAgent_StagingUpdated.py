@@ -3,6 +3,7 @@ import google.generativeai as genai
 from datetime import datetime 
 from typing import List, Dict, Any, Tuple
 import os 
+from bson import ObjectId 
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware 
@@ -46,6 +47,10 @@ class DynamicTips:
  
     # ── 1. Fetch all transcripts for a simulation ──────────────────────────
     def get_transcripts_by_simulation(self, simulation_id: str) -> List[Dict[Any, Any]]:
+        try: 
+            object_id = ObjectId(simulation_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid simulation_id format: '{simulation_id}' is not a valid ObjectId")
         return list(
             transcripts_collection
             .find({"simulation": simulation_id})
