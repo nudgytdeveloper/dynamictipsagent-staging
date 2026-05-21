@@ -121,7 +121,7 @@ class DynamicTips:
             Focus on: tone, word choice, empathy signals, question framing, and clarity of intent.
             Do NOT evaluate the "AI CHARACTER" messages.
             Do NOT add any preamble, heading, or closing text outside the tip blocks.
-            Always keep each tip length to 200 characters or less. 
+            Always keep each tip length to 500 characters or less. 
             """
 
             response = self.model.generate_content(
