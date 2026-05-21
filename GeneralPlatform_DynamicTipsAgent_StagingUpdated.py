@@ -112,15 +112,16 @@ class DynamicTips:
             2. Explain what effect it likely had on the other person
             3. Give a concrete alternative phrasing or behavior they can use right away
 
-            Provide 3–5 tips. Format each tip as a single self-contained block separated by a blank line:
+            Provide 1 tip. Format each tip as a single self-contained block separated by a blank line:
 
-            🔍 What I noticed: [specific behavior or phrasing]
+            🔍 What I noticed: [specific behavior]
             💬 Why it matters: [impact on the listener/relationship]
             ✅ Try this instead: [ready-to-use alternative]
 
             Focus on: tone, word choice, empathy signals, question framing, and clarity of intent.
             Do NOT evaluate the "AI CHARACTER" messages.
             Do NOT add any preamble, heading, or closing text outside the tip blocks.
+            Always keep each tip length to 200 characters or less. 
             """
 
             response = self.model.generate_content(
@@ -202,7 +203,6 @@ def health_check():
     return {"status": "ok"}
  
 
-# ── POST /tips (body: { "simulation_id": "..." }) ──────────────────────────
 @app.post("/tips", response_model=TipsResponse)
 def get_tips(request: TipsRequest):
     try:
@@ -220,8 +220,6 @@ def get_tips(request: TipsRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── POST /tips/{simulation_id} (simulation_id in URL path) ────────────────
-# FIX: Changed from GET to POST to match requirement.
 @app.post("/tips/{simulation_id}", response_model=TipsResponse)
 def get_tips_by_id(simulation_id: str):
     """
