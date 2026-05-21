@@ -47,36 +47,15 @@ class DynamicTips:
  
     # ── 1. Fetch all transcripts for a simulation ──────────────────────────
     def get_transcripts_by_simulation(self, simulation_id: str) -> List[Dict[Any, Any]]:
-        """
-        FIX: The ObjectId was being constructed but never used in the query.
-        We now query with the ObjectId so MongoDB can match the stored reference type.
-        We also fall back to the raw string if no results are found, to handle
-        collections where simulation is stored as a plain string.
-        """
         try: 
             object_id = ObjectId(simulation_id)
         except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid simulation_id format: '{simulation_id}' is not a valid ObjectId"
-            )
-
-        # Try ObjectId first (the most common storage format for MongoDB references)
-        results = list(
+            raise HTTPException(status_code=400, detail=f"Invalid simulation_id format: '{simulation_id}' is not a valid ObjectId")
+        return list(
             transcripts_collection
-            .find({"simulation": object_id})
+            .find({"simulation": simulation_id})
             .sort("created_at", pymongo.ASCENDING)
         )
-
-        # Fall back to string match if nothing found
-        if not results:
-            results = list(
-                transcripts_collection
-                .find({"simulation": simulation_id})
-                .sort("created_at", pymongo.ASCENDING)
-            )
-
-        return results
  
     # ── 2. Combine transcripts into a single readable string ───────────────
     def combine_transcripts(self, transcripts: List[Dict[Any, Any]]) -> str:
@@ -87,7 +66,7 @@ class DynamicTips:
             if from_type == "User":
                 speaker = "HUMAN USER"
             elif from_type == "Character":
-                speaker = "AI CHARACTER"
+                speaker = "AI CHARACTER"      # ← fixed: was `==` instead of `=`
             else:
                 speaker = from_type
  
@@ -112,7 +91,7 @@ class DynamicTips:
             2. Explain what effect it likely had on the other person
             3. Give a concrete alternative phrasing or behavior they can use right away
 
-            Provide 3–5 tips. Format each tip as a single self-contained block separated by a blank line:
+            Provide 3–5 tips. Format each as:
 
             🔍 What I noticed: [specific behavior or phrasing]
             💬 Why it matters: [impact on the listener/relationship]
@@ -120,7 +99,6 @@ class DynamicTips:
 
             Focus on: tone, word choice, empathy signals, question framing, and clarity of intent.
             Do NOT evaluate the "AI CHARACTER" messages.
-            Do NOT add any preamble, heading, or closing text outside the tip blocks.
             """
 
             response = self.model.generate_content(
@@ -132,10 +110,7 @@ class DynamicTips:
             )
  
             tips_text = response.text.strip()
-
-            # FIX: Split on double newlines so each full tip block is one list item,
-            # rather than splitting on every newline which fragments tips into individual lines.
-            tips = [block.strip() for block in tips_text.split("\n\n") if block.strip()]
+            tips = [tip.strip() for tip in tips_text.split("\n") if tip.strip()]
             return tips, None
  
         except Exception as e:
@@ -178,7 +153,7 @@ class DynamicTips:
                 "error": "No transcripts found for this simulation.",
             }
  
-        combined    = self.combine_transcripts(transcripts)
+        combined   = self.combine_transcripts(transcripts)
         tips, error = self.generate_tips(combined)
  
         saved = False
@@ -201,8 +176,7 @@ def health_check():
     """Simple liveness probe."""
     return {"status": "ok"}
  
-
-# ── POST /tips (body: { "simulation_id": "..." }) ──────────────────────────
+ 
 @app.post("/tips", response_model=TipsResponse)
 def get_tips(request: TipsRequest):
     try:
@@ -215,18 +189,17 @@ def get_tips(request: TipsRequest):
     except HTTPException:
         raise
     except Exception as e:
+        # This logs the full traceback to Render logs instead of crashing
         import traceback
         print(f"UNHANDLED ERROR: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── POST /tips/{simulation_id} (simulation_id in URL path) ────────────────
-# FIX: Changed from GET to POST to match requirement.
-@app.post("/tips/{simulation_id}", response_model=TipsResponse)
+ 
+ 
+@app.get("/tips/{simulation_id}", response_model=TipsResponse)
 def get_tips_by_id(simulation_id: str):
     """
-    Convenience POST endpoint — same behaviour as /tips but with
-    simulation_id in the URL path instead of the request body.
+    Convenience GET endpoint — same behaviour, simulation_id in the URL path.
+    Useful for simple button clicks that just fire a GET request.
     """
     result = advisor.process_simulation(simulation_id)
  
@@ -235,10 +208,10 @@ def get_tips_by_id(simulation_id: str):
  
     return result
 
-
-# ── Debug endpoint: check how simulation_id is stored in MongoDB ──────────
 @app.get("/debug/raw/{simulation_id}")
 def debug_raw(simulation_id: str):
+    from bson import ObjectId
+
     results = {}
 
     count_string = transcripts_collection.count_documents({"simulation": simulation_id})
@@ -255,5 +228,5 @@ def debug_raw(simulation_id: str):
 
 if __name__ == "__main__":
     import uvicorn, os
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8000))  # fallback to 8000 locally
     uvicorn.run("dynamic_tips_api:app", host="0.0.0.0", port=port)
