@@ -35,7 +35,7 @@ class TipsRequest(BaseModel):
 
 class TipsResponse(BaseModel):
     simulation_id: str
-    tips: List[str]
+    tips: str
     transcript_count: int 
     saved_to_db: bool 
     timestamp: str
@@ -97,7 +97,7 @@ class DynamicTips:
         return combined_text
  
     # ── 3. Call Gemini to generate tips ────────────────────────────────────
-    def generate_tips(self, transcript: str) -> Tuple[List[str], str | None]:
+    def generate_tips(self, transcript: str) -> Tuple[str, str | None]:
         try:
             prompt = f"""
             You are a communication coach helping learners in Singapore improve their interpersonal effectiveness.
@@ -136,7 +136,7 @@ class DynamicTips:
 
             # FIX: Split on double newlines so each full tip block is one list item,
             # rather than splitting on every newline which fragments tips into individual lines.
-            tips = [block.strip() for block in tips_text.split("\n\n") if block.strip()]
+            tips = "\n\n".join(block.strip() for block in tips_text.split("\n\n") if block.strip())
             return tips, None
  
         except Exception as e:
@@ -172,7 +172,7 @@ class DynamicTips:
         if not transcripts:
             return {
                 "simulation_id": simulation_id,
-                "tips": [],
+                "tips": "",
                 "transcript_count": 0,
                 "saved_to_db": False,
                 "timestamp": datetime.now().isoformat(),
@@ -184,7 +184,7 @@ class DynamicTips:
  
         saved = False
         if tips:
-            saved = self.save_tips_to_mongodb(simulation_id, tips)
+            saved = self.save_tips_to_mongodb(simulation_id, [tips])
  
         return {
             "simulation_id":    simulation_id,
