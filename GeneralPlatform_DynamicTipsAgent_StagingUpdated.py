@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Tuple, Optional
 import os
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote, urlsplit, urlunsplit
 from bson import ObjectId
 
 from fastapi import FastAPI, HTTPException
@@ -122,6 +122,24 @@ def get_sop_tips_file_url(simulation: Dict[str, Any]) -> Optional[str]:
     return _first_file_url(service_level_doc.get(SOP_TIPS_FILE_KEY))
 
 
+def _encode_url(url: str) -> str:
+    """Percent-encode the path/query of a URL.
+
+    SOP filenames routinely contain spaces (e.g. "Tips SOP Sample .pdf").
+    urllib rejects those outright with http.client.InvalidURL, so encode before
+    requesting. `safe="%"` keeps any already-encoded sequence from being
+    double-encoded.
+    """
+    parts = urlsplit(url)
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        quote(parts.path, safe="/%"),
+        quote(parts.query, safe="=&%"),
+        parts.fragment,
+    ))
+
+
 def fetch_sop_document(url: str) -> Optional[Dict[str, Any]]:
     """Download the SOP file and return a part Gemini can consume.
 
@@ -142,11 +160,16 @@ def fetch_sop_document(url: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        with urllib.request.urlopen(url, timeout=SOP_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        request_url = _encode_url(url)
+    except Exception:
+        request_url = url
+
+    try:
+        with urllib.request.urlopen(request_url, timeout=SOP_DOWNLOAD_TIMEOUT_SECONDS) as response:
             # Read one byte past the cap so an oversized file is detected rather
             # than silently truncated into a malformed PDF.
             payload = response.read(SOP_MAX_BYTES + 1)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as e:
+    except Exception as e:
         print(f"Could not download SOP file {url}: {e}")
         return None
 
