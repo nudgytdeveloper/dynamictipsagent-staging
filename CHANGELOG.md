@@ -8,6 +8,8 @@
 - `sop_applied` and `sop_file_url` on the `/tips` response and on each persisted tip entry, so a tip can be traced back to the document that produced it
 
 ### Fixed
+- SOP file URLs are percent-encoded before download. Uploaded SOP filenames routinely contain spaces (e.g. `Tips SOP Sample .pdf`), which `urllib` rejects with `http.client.InvalidURL`; found by the first end-to-end run against a real staging simulation, which returned HTTP 500
+- `fetch_sop_document` caught only `URLError`/`HTTPError`/`OSError`/`ValueError`, but `http.client.InvalidURL` descends from `Exception` alone, so a bad SOP URL escaped as an unhandled 500 instead of degrading. It now catches `Exception`, honouring its documented "never raises" contract
 - `generate_tips` returned `[]` on a generation failure while `TipsResponse.tips` is typed `str`, turning every Gemini error into a pydantic validation error (HTTP 500) instead of a clean error payload; it now returns `""`
 
 ### Changed
