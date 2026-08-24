@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-24
+
+### Added
+- Tips follow the learner's Continuous Learning instruction: the agent reads the active `agent_learner_instructions` document for the simulation's learner and injects it into the prompt after the SOP block, so a retry targets the learner's weakest skills first and a first attempt gets simple, encouraging tips
+- Each persisted tip entry records `cl_instruction_id`, `cl_instruction_version` and `cl_stage`; the `/tips` response gains `cl_applied`
+- `CL_INSTRUCTIONS_COLLECTION` env var (default `agent_learner_instructions`)
+
 ## 2026-08-11
 
 ### Added

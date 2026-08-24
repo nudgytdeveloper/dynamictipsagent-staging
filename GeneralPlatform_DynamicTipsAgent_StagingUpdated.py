@@ -1,6 +1,6 @@
 import pymongo
 import google.generativeai as genai
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
 import os
 import urllib.request
@@ -122,6 +122,84 @@ def get_sop_tips_file_url(simulation: Dict[str, Any]) -> Optional[str]:
     return _first_file_url(service_level_doc.get(SOP_TIPS_FILE_KEY))
 
 
+# --- Continuous Learning (Block D) consumer helper — pasted verbatim from continous-learning-agent/README.md ---
+CL_INSTRUCTIONS_COLLECTION = os.environ.get("CL_INSTRUCTIONS_COLLECTION", "agent_learner_instructions")
+CL_BEHAVIOR_CHANGES_COLLECTION = "agent_behavior_changes"
+CL_SIM_LEARNER_KEYS = ("learner", "user", "learner_id", "user_id")
+CL_ACTIVE_STATUSES = ("approved", "applied")
+CL_STATUS_APPLIED = "applied"
+CL_AGENT_NAME = "tips"
+FIELD_CL_INSTRUCTION_ID = "cl_instruction_id"
+FIELD_CL_INSTRUCTION_VERSION = "cl_instruction_version"
+FIELD_CL_STAGE = "cl_stage"
+CL_ABSENT_BLOCK = """
+            No prior-session background is available for this learner; treat this as a standalone session and do not refer to previous sessions.
+            """
+
+
+def get_learner_instruction(simulation):
+    """Active Continuous-Learning instruction for this simulation's learner, or None. Never raises."""
+    try:
+        learner_id = next((simulation.get(k) for k in CL_SIM_LEARNER_KEYS if simulation and simulation.get(k) is not None), None)
+        if learner_id is None:
+            return None
+        ids = [learner_id, str(learner_id)]
+        try:
+            ids.append(ObjectId(str(learner_id)))
+        except Exception:
+            pass
+        doc = db[CL_INSTRUCTIONS_COLLECTION].find_one(
+            {"learner_id": {"$in": ids}, "status": {"$in": list(CL_ACTIVE_STATUSES)}}, sort=[("version", -1)])
+        if not doc or not doc.get("instruction"):
+            return None
+        target = doc.get("for_service_level")
+        if target and simulation.get("service_level") is not None and str(target) != str(simulation.get("service_level")):
+            return None  # written for another scenario; the worker refreshes it when this one starts
+        return doc
+    except Exception as e:
+        print(f"[DEBUG] CL instruction lookup failed: {e}")
+        return None
+
+
+def learner_instruction_block(doc):
+    """Prompt block with an explicit empty case (same discipline as tips_instruction)."""
+    if doc and doc.get("instruction"):
+        hint = (doc.get("per_agent") or {}).get(CL_AGENT_NAME) or ""
+        return f"""
+            Background on this learner from their previous sessions (private; follow it, never quote or mention it):
+            ---
+            {doc["instruction"]}
+            {hint}
+            ---
+            """
+    return CL_ABSENT_BLOCK
+
+
+def cl_provenance(doc):
+    return {FIELD_CL_INSTRUCTION_ID: doc.get("_id") if doc else None,
+            FIELD_CL_INSTRUCTION_VERSION: doc.get("version") if doc else None,
+            FIELD_CL_STAGE: doc.get("stage") if doc else None}
+
+
+def cl_mark_applied(doc, simulation_id):
+    """Audit trail: this agent used the instruction for this simulation. Never raises."""
+    if not doc:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        db[CL_INSTRUCTIONS_COLLECTION].update_one({"_id": doc["_id"], "applied_at": None}, {"$set": {"applied_at": now}})
+        db[CL_INSTRUCTIONS_COLLECTION].update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"status": CL_STATUS_APPLIED},
+             "$push": {"applied": {"agent": CL_AGENT_NAME, "simulation_id": str(simulation_id), "at": now}}})
+        db[CL_BEHAVIOR_CHANGES_COLLECTION].update_one(
+            {"instruction_id": doc["_id"], "agent": CL_AGENT_NAME, "applied_at": None},
+            {"$set": {"applied_at": now, "applied_simulation_id": str(simulation_id)}})
+    except Exception as e:
+        print(f"[DEBUG] CL mark-applied failed: {e}")
+# --- end Continuous Learning consumer helper ---
+
+
 def _encode_url(url: str) -> str:
     """Percent-encode the path/query of a URL.
 
@@ -215,6 +293,8 @@ class TipsResponse(BaseModel):
     # callers that ignore these fields keep working unchanged.
     sop_applied: bool = False
     sop_file_url: str | None = None
+    # Whether a Continuous Learning instruction for this learner shaped the tip.
+    cl_applied: bool = False
 
 class DynamicTips:
     def __init__(self):
@@ -273,7 +353,8 @@ class DynamicTips:
  
     # ── 3. Call Gemini to generate tips ────────────────────────────────────
     def generate_tips(self, transcript: str,
-                      sop_document: Optional[Dict[str, Any]] = None) -> Tuple[str, str | None]:
+                      sop_document: Optional[Dict[str, Any]] = None,
+                      learner_instruction: Optional[Dict[str, Any]] = None) -> Tuple[str, str | None]:
         try:
             # When the service has an SOP / best-practice document attached, the
             # tip is drawn from that document's specific instructions instead of
@@ -303,6 +384,7 @@ class DynamicTips:
             prompt = f"""
             You are a communication coach helping learners in Singapore improve their interpersonal effectiveness.
             {sop_instruction}
+            {learner_instruction_block(learner_instruction)}
             Analyze ONLY the "HUMAN USER" messages in this conversation transcript:
             {transcript}
 
@@ -358,14 +440,16 @@ class DynamicTips:
     # ── 4. Persist tips to MongoDB ─────────────────────────────────────────
     def save_tips_to_mongodb(self, simulation_id: str, tips: List[str],
                              sop_file_url: Optional[str] = None,
-                             sop_applied: bool = False) -> bool:
+                             sop_applied: bool = False,
+                             learner_instruction: Optional[Dict[str, Any]] = None) -> bool:
         try:
             timestamp   = datetime.now()
             # Each entry records the SOP it came from, so a tip can be traced back
             # to the document that produced it.
             tip_entries = [{"tip": tip, "timestamp": timestamp,
                             "sop_file_url": sop_file_url,
-                            "sop_applied": sop_applied} for tip in tips]
+                            "sop_applied": sop_applied,
+                            **cl_provenance(learner_instruction)} for tip in tips]
 
             result = tips_collection.update_one(
                 {"simulation_id": simulation_id},
@@ -378,6 +462,7 @@ class DynamicTips:
                 },
                 upsert=True,
             )
+            cl_mark_applied(learner_instruction, simulation_id)
             return result.acknowledged
  
         except Exception as e:
@@ -403,6 +488,10 @@ class DynamicTips:
         sop_document = None
         sop_file_url = None
         simulation = get_simulation(simulation_id)
+        # Continuous Learning: the learner's active Block D, if the loop has written one.
+        learner_instruction = get_learner_instruction(simulation) if simulation else None
+        if learner_instruction:
+            print(f"CL instruction for simulation {simulation_id}: {learner_instruction.get('stage')} v{learner_instruction.get('version')}")
         if simulation:
             sop_file_url = get_sop_tips_file_url(simulation)
             if sop_file_url:
@@ -418,7 +507,7 @@ class DynamicTips:
                   f"generating a generic tip")
 
         combined    = self.combine_transcripts(transcripts)
-        tips, error = self.generate_tips(combined, sop_document)
+        tips, error = self.generate_tips(combined, sop_document, learner_instruction)
 
         saved = False
         if tips:
@@ -426,6 +515,7 @@ class DynamicTips:
                 simulation_id, [tips],
                 sop_file_url=sop_file_url,
                 sop_applied=bool(sop_document),
+                learner_instruction=learner_instruction,
             )
 
         return {
@@ -437,6 +527,7 @@ class DynamicTips:
             "error":            error,
             "sop_applied":      bool(sop_document),
             "sop_file_url":     sop_file_url,
+            "cl_applied":       bool(learner_instruction),
         }
 
 advisor = DynamicTips() 
