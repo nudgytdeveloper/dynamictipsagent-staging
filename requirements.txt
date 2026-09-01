@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 pymongo
-google-generativeai
+google-genai
 pydantic

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-09-01
+
+### Changed
+- Gemini is called with thinking switched off (`GEMINI_THINKING_BUDGET`, default `0`); a single ≤500-character tip does not need the model to reason first, and that reasoning was most of the 9.4 s median / 12.4 s p90 measured on staging 2026-08-25 → 08-31
+- The agent now uses the `google-genai` SDK; `google-generativeai` is end-of-life and had no way to set a thinking budget
+- The SOP file is downloaded once per URL and cached (`SOP_CACHE_TTL_SECONDS`, default 600; an unusable file is remembered for `SOP_CACHE_FAILURE_TTL_SECONDS`, default 60) instead of on every request
+- Transcript and simulation lookups run concurrently, as do the Continuous Learning lookup and the SOP download
+- The three Continuous Learning audit writes run after the response is sent
+
+### Added
+- `duration_ms` on the `/tips` response, and one `Tips for simulation …: <total>ms (lookup= context= gemini= save=)` log line per request
+- `GEMINI_MODEL` (default `gemini-2.5-flash`) and `GEMINI_TIMEOUT_SECONDS` (default `60`) env vars
+
+### Fixed
+- A Gemini response with no text (safety block, or the whole budget spent on thinking) is returned as an error payload instead of raising
+- Log lines reach Render as they happen instead of in one clump at the end of the request
+
 ## 2026-08-24
 
 ### Added
