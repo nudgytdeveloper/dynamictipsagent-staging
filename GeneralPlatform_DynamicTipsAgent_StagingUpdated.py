@@ -43,8 +43,13 @@ GEMINI_API_KEY         = os.environ.get("GEMINI_API_KEY")
 # raised from the Render dashboard, without a deploy, if tip quality ever
 # needs it back. The legacy google-generativeai SDK could not set this at
 # all, which is why the agent now uses google-genai.
+#
+# 2026-10-07: the replacement API key's project cannot call gemini-2.5-flash
+# ("no longer available to new users"), so the default moved to
+# gemini-3.8-flash. A negative budget leaves thinking_config off the request
+# entirely, for a model that refuses a budget of 0.
 # ============================================================================
-GEMINI_MODEL             = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL             = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_THINKING_BUDGET   = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))
 # Bounds a hung generation; the old client would wait on it indefinitely.
 GEMINI_TIMEOUT_SECONDS   = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "60"))
@@ -549,7 +554,8 @@ class DynamicTips:
                 config=genai_types.GenerateContentConfig(
                     temperature=GEMINI_TEMPERATURE,
                     max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET),
+                    thinking_config=(genai_types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
+                                     if GEMINI_THINKING_BUDGET >= 0 else None),
                 ),
             )
 

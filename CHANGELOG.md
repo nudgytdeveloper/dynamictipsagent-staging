@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-07
+
+### Changed
+- `GEMINI_MODEL` defaults to `gemini-3.8-flash`; the replacement Gemini key cannot call `gemini-2.5-flash`
+- A negative `GEMINI_THINKING_BUDGET` leaves `thinking_config` off the request
+
 ## 2026-09-01
 
 ### Changed
