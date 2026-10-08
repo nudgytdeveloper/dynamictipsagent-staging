@@ -3,3 +3,4 @@ uvicorn
 pymongo
 google-genai
 pydantic
+openai

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-08
+
+### Added
+- OpenAI fallback: when Gemini errors or returns no text, the same prompt and SOP PDF go to OpenAI (`OPENAI_API_KEY`, `OPENAI_FALLBACK_MODEL` default `gpt-4o-mini`, `OPENAI_TIMEOUT_SECONDS` default `60`); without the key nothing changes
+- `model` on the `/tips` response and in the timing log line: the model that wrote the tip
+
 ## 2026-10-07
 
 ### Changed

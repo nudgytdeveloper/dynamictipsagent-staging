@@ -1,3 +1,4 @@
+import base64
 import pymongo
 from google import genai
 from google.genai import types as genai_types
@@ -16,6 +17,7 @@ from bson import ObjectId
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from openai import OpenAI
 
 # Render captures stdout through a pipe, where Python block-buffers it: every
 # print of a request used to surface in one clump at the end, so the per-stage
@@ -57,6 +59,17 @@ GEMINI_TEMPERATURE       = 0.5
 # Thinking tokens (when a budget is set) are charged against this cap too.
 GEMINI_MAX_OUTPUT_TOKENS = 3000
 
+# ============================================================================
+# OpenAI fallback (2026-10-07). Gemini failures left the learner with "Failed
+# to generate guidance" — first a free-tier quota (20 requests a day), then a
+# model the replacement key could not call. When Gemini errors or returns no
+# text, the same prompt (and SOP PDF) goes to OpenAI instead. Unset
+# OPENAI_API_KEY and the agent behaves exactly as before.
+# ============================================================================
+OPENAI_API_KEY           = os.environ.get("OPENAI_API_KEY")
+OPENAI_FALLBACK_MODEL    = os.environ.get("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT_SECONDS   = int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
+
 client                 = pymongo.MongoClient(MONGO_URI)
 db                     = client[DB_NAME]
 transcripts_collection = db[TRANSCRIPTS_COLLECTION]
@@ -80,6 +93,38 @@ def gemini_client() -> genai.Client:
                 http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_SECONDS * 1000),
             )
         return _gemini_client
+
+
+_openai_client: Optional[OpenAI] = None
+_openai_client_lock = threading.Lock()
+
+
+def openai_client() -> OpenAI:
+    """One shared OpenAI client for the fallback, built on first use."""
+    global _openai_client
+    with _openai_client_lock:
+        if _openai_client is None:
+            _openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS, max_retries=1)
+        return _openai_client
+
+
+def generate_with_openai(prompt: str, sop_document: Optional[Dict[str, Any]] = None) -> str:
+    """The Gemini prompt, answered by OpenAI. A PDF SOP rides along as a file part."""
+    content: List[Dict[str, Any]] = []
+    if sop_document and sop_document.get("data"):
+        encoded = base64.b64encode(sop_document["data"]).decode("ascii")
+        content.append({"type": "file", "file": {
+            "filename": "sop.pdf",
+            "file_data": f"data:{sop_document['mime_type']};base64,{encoded}",
+        }})
+    content.append({"type": "text", "text": prompt})
+    response = openai_client().chat.completions.create(
+        model=OPENAI_FALLBACK_MODEL,
+        messages=[{"role": "user", "content": content}],
+        temperature=GEMINI_TEMPERATURE,
+        max_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 def response_text(response: Any) -> str:
@@ -431,6 +476,8 @@ class TipsResponse(BaseModel):
     # Wall-clock time the agent spent on this request, so response time can be
     # read off the payload instead of inferred from the caller's stopwatch.
     duration_ms: int | None = None
+    # Which model wrote the tip — the Gemini model, or the OpenAI fallback.
+    model: str | None = None
 
 class DynamicTips:
 
@@ -488,7 +535,9 @@ class DynamicTips:
     # ── 3. Call Gemini to generate tips ────────────────────────────────────
     def generate_tips(self, transcript: str,
                       sop_document: Optional[Dict[str, Any]] = None,
-                      learner_instruction: Optional[Dict[str, Any]] = None) -> Tuple[str, str | None]:
+                      learner_instruction: Optional[Dict[str, Any]] = None) -> Tuple[str, str | None, str]:
+        """Return (tips, error, model that answered)."""
+        model_used = GEMINI_MODEL
         try:
             # When the service has an SOP / best-practice document attached, the
             # tip is drawn from that document's specific instructions instead of
@@ -548,31 +597,47 @@ class DynamicTips:
                     data=sop_document["data"], mime_type=sop_document["mime_type"]))
             contents.append(prompt)
 
-            response = gemini_client().models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    temperature=GEMINI_TEMPERATURE,
-                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                    thinking_config=(genai_types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
-                                     if GEMINI_THINKING_BUDGET >= 0 else None),
-                ),
-            )
+            tips_text, gemini_error = "", None
+            try:
+                response = gemini_client().models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=contents,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=GEMINI_TEMPERATURE,
+                        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                        thinking_config=(genai_types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
+                                         if GEMINI_THINKING_BUDGET >= 0 else None),
+                    ),
+                )
+                tips_text = response_text(response)
+                if not tips_text:
+                    gemini_error = f"Gemini returned no text (finish_reason={finish_reason(response)})"
+            except Exception as e:
+                gemini_error = f"Gemini: {e}"
 
-            tips_text = response_text(response)
+            if not tips_text and OPENAI_API_KEY:
+                print(f"{gemini_error[:300]} — falling back to {OPENAI_FALLBACK_MODEL}")
+                model_used = OPENAI_FALLBACK_MODEL
+                try:
+                    tips_text = generate_with_openai(prompt, sop_document)
+                    if not tips_text:
+                        gemini_error = f"{gemini_error}; OpenAI returned no text"
+                except Exception as e:
+                    gemini_error = f"{gemini_error}; OpenAI: {e}"
+
             if not tips_text:
-                return "", f"Error generating tips: Gemini returned no text (finish_reason={finish_reason(response)})"
+                return "", f"Error generating tips: {gemini_error}", model_used
 
             # FIX: Split on double newlines so each full tip block is one list item,
             # rather than splitting on every newline which fragments tips into individual lines.
             tips = "\n\n".join(block.strip() for block in tips_text.split("\n\n") if block.strip())
-            return tips, None
+            return tips, None, model_used
 
         except Exception as e:
             # FIX: return a str, not []. TipsResponse.tips is typed `str`, so the
             # old `return []` made every generation failure a pydantic validation
             # error (HTTP 500) instead of a clean error payload.
-            return "", f"Error generating tips: {e}"
+            return "", f"Error generating tips: {e}", model_used
  
     # ── 4. Persist tips to MongoDB ─────────────────────────────────────────
     def save_tips_to_mongodb(self, simulation_id: str, tips: List[str],
@@ -662,7 +727,7 @@ class DynamicTips:
         lap("context")
 
         combined    = self.combine_transcripts(transcripts)
-        tips, error = self.generate_tips(combined, sop_document, learner_instruction)
+        tips, error, model_used = self.generate_tips(combined, sop_document, learner_instruction)
         lap("gemini")
 
         saved = False
@@ -685,7 +750,7 @@ class DynamicTips:
               f"(lookup={timings['lookup']} context={timings['context']} "
               f"gemini={timings['gemini']} save={timings['save']}) "
               f"transcripts={len(transcripts)} sop={bool(sop_document)} cl={bool(learner_instruction)} "
-              f"model={GEMINI_MODEL} thinking_budget={GEMINI_THINKING_BUDGET}"
+              f"model={model_used} thinking_budget={GEMINI_THINKING_BUDGET}"
               + (f" error={error}" if error else ""))
 
         return {
@@ -699,6 +764,7 @@ class DynamicTips:
             "sop_file_url":     sop_file_url,
             "cl_applied":       bool(learner_instruction),
             "duration_ms":      duration_ms,
+            "model":            model_used,
         }
 
 advisor = DynamicTips()
