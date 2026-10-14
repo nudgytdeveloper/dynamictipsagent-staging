@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor
 import os
+import re
 import sys
 import threading
 import time
@@ -449,6 +450,137 @@ def resolve_sop_document(simulation_id: str,
     return sop_file_url, sop_document
 
 
+# ============================================================================
+# Transcript anchors (task 295, "Tips reflected against Transcript").
+#
+# The platform is to show each tip beside the transcript line it is about, and
+# let trainers edit, delete and comment on a tip. Neither was possible: a stored
+# tip carried no id and no reference to the transcript. Placing tips by time
+# does not work either — every tip reads the whole conversation so far, so a
+# tip issued at minute five can be about the learner's first message.
+#
+# So the learner's messages are labelled in the prompt ([U1], [U2], …) and the
+# model names the one its tip is about on a trailing ANCHOR line, which is
+# stripped before the tip is stored. The model's pick is checked against the
+# real messages; failing that, a phrase the tip quotes is matched against
+# them; failing that, the tip is anchored to the learner's latest message.
+# ============================================================================
+TRANSCRIPT_FROM_TYPE_KEY  = "from_type"
+TRANSCRIPT_TEXT_KEY       = "dialogue_value"
+FROM_TYPE_USER            = "User"
+FROM_TYPE_CHARACTER       = "Character"
+SPEAKER_USER              = "HUMAN USER"
+SPEAKER_CHARACTER         = "AI CHARACTER"
+LEARNER_LABEL_PREFIX      = "U"
+
+FIELD_TIP_ID               = "_id"
+FIELD_ANCHOR_TRANSCRIPT_ID = "anchor_transcript_id"
+FIELD_ANCHOR_QUOTE         = "anchor_quote"
+FIELD_ANCHOR_METHOD        = "anchor_method"
+FIELD_LAST_TRANSCRIPT_ID   = "last_transcript_id"
+
+ANCHOR_METHOD_MODEL       = "model"        # the model's ANCHOR line named a real learner message
+ANCHOR_METHOD_QUOTE_MATCH = "quote_match"  # a phrase quoted in the tip was found in a learner message
+ANCHOR_METHOD_LATEST      = "latest"       # neither: the learner's latest message
+
+# `ANCHOR: U3 | "exact excerpt"` — the excerpt is optional.
+ANCHOR_LINE_PATTERN  = re.compile(r'^\s*\**\s*ANCHOR\s*\**\s*:\s*\**\s*\[?U(\d+)\]?\s*(?:\|\s*(.*?))?\s*$',
+                                  re.IGNORECASE | re.MULTILINE)
+# Any [U3] label the model leaks into the tip itself.
+LEARNER_LABEL_PATTERN = re.compile(r'\s*\[U\d+\]')
+# Phrases a tip quotes: "…" or “…”.
+TIP_QUOTE_PATTERN     = re.compile(r'"([^"]+)"|“([^”]+)”')
+# Quoted fragments shorter than this match too much to place a tip by.
+MIN_QUOTE_MATCH_CHARS = 8
+QUOTE_EDGE_CHARS      = " \t\n\"'“”‘’.…,;:!?"
+# One character for one character, so a match position in the folded text is
+# the same position in the original.
+QUOTE_FOLD_TABLE      = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
+
+
+def learner_label(index: int) -> str:
+    return f"{LEARNER_LABEL_PREFIX}{index}"
+
+
+def find_excerpt(excerpt: Optional[str], text: str) -> Optional[str]:
+    """The span of `text` that `excerpt` quotes, ignoring case, quote style and
+    spacing; None if it is not there. Returns the original wording, so the
+    platform can highlight it with a plain substring search."""
+    if not excerpt or not text:
+        return None
+    words = excerpt.translate(QUOTE_FOLD_TABLE).strip(QUOTE_EDGE_CHARS).split()
+    if not words or len(" ".join(words)) < MIN_QUOTE_MATCH_CHARS:
+        return None
+    pattern = r"\s+".join(re.escape(word) for word in words)
+    match = re.search(pattern, text.translate(QUOTE_FOLD_TABLE), re.IGNORECASE)
+    return text[match.start():match.end()] if match else None
+
+
+def split_anchor_line(tip_text: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """(tip without ANCHOR lines or [U#] labels, label named, excerpt given)."""
+    matches = list(ANCHOR_LINE_PATTERN.finditer(tip_text))
+    label = excerpt = None
+    if matches:
+        last = matches[-1]
+        label = learner_label(int(last.group(1)))
+        excerpt = (last.group(2) or "").strip() or None
+    cleaned = LEARNER_LABEL_PATTERN.sub("", ANCHOR_LINE_PATTERN.sub("", tip_text))
+    tip = "\n\n".join(block.strip() for block in cleaned.split("\n\n") if block.strip())
+    return tip, label, excerpt
+
+
+def quoted_phrases(tip_text: str) -> List[str]:
+    return [a or b for a, b in TIP_QUOTE_PATTERN.findall(tip_text)]
+
+
+def str_or_none(value: Any) -> Optional[str]:
+    return None if value is None else str(value)
+
+
+def resolve_anchor(tip_text: str, label: Optional[str], excerpt: Optional[str],
+                   learner_messages: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Which learner message a tip is about, and the words it quotes from it.
+
+    `learner_messages` maps each prompt label to its transcript document, in
+    conversation order. Returns the anchor fields to store with the tip, all
+    None when the conversation has no learner message to anchor to.
+    """
+    none = {FIELD_ANCHOR_TRANSCRIPT_ID: None, FIELD_ANCHOR_QUOTE: None, FIELD_ANCHOR_METHOD: None}
+    if not learner_messages:
+        return none
+
+    def anchor(message: Dict[str, Any], method: str, quote: Optional[str]) -> Dict[str, Any]:
+        return {FIELD_ANCHOR_TRANSCRIPT_ID: message.get("_id"),
+                FIELD_ANCHOR_QUOTE: quote,
+                FIELD_ANCHOR_METHOD: method}
+
+    def quote_in(message: Dict[str, Any]) -> Optional[str]:
+        text = message.get(TRANSCRIPT_TEXT_KEY) or ""
+        for phrase in ([excerpt] if excerpt else []) + quoted_phrases(tip_text):
+            found = find_excerpt(phrase, text)
+            if found:
+                return found
+        return None
+
+    named = learner_messages.get(label) if label else None
+    if named is not None:
+        quote = quote_in(named)
+        if quote:
+            return anchor(named, ANCHOR_METHOD_MODEL, quote)
+
+    # The tip's own quote, found verbatim in another message, outweighs a label
+    # with nothing to back it. Latest message first: a learner who repeats a
+    # phrase is most likely being coached on the time they just said it.
+    for message in reversed(list(learner_messages.values())):
+        quote = quote_in(message)
+        if quote:
+            return anchor(message, ANCHOR_METHOD_QUOTE_MATCH, quote)
+
+    if named is not None:
+        return anchor(named, ANCHOR_METHOD_MODEL, None)
+    return anchor(list(learner_messages.values())[-1], ANCHOR_METHOD_LATEST, None)
+
+
 app = FastAPI(title="Dynamic Tips API")
 app.add_middleware(
     CORSMiddleware,
@@ -478,6 +610,11 @@ class TipsResponse(BaseModel):
     duration_ms: int | None = None
     # Which model wrote the tip — the Gemini model, or the OpenAI fallback.
     model: str | None = None
+    # Task 295: the stored tip's id, and the transcript line it is about.
+    tip_id: str | None = None
+    anchor_transcript_id: str | None = None
+    anchor_quote: str | None = None
+    anchor_method: str | None = None
 
 class DynamicTips:
 
@@ -515,22 +652,28 @@ class DynamicTips:
         return results
  
     # ── 2. Combine transcripts into a single readable string ───────────────
-    def combine_transcripts(self, transcripts: List[Dict[Any, Any]]) -> str:
+    def combine_transcripts(self, transcripts: List[Dict[Any, Any]]) -> Tuple[str, Dict[str, Dict[Any, Any]]]:
+        """(prompt transcript, {label: transcript doc} for the learner's messages).
+
+        Each learner message is labelled [U1], [U2], … so the model can say
+        which one its tip is about (task 295).
+        """
         combined_text = ""
+        learner_messages: Dict[str, Dict[Any, Any]] = {}
         for transcript in transcripts:
-            from_type = transcript.get("from_type", "Unknown")
- 
-            if from_type == "User":
-                speaker = "HUMAN USER"
-            elif from_type == "Character":
-                speaker = "AI CHARACTER"
+            from_type = transcript.get(TRANSCRIPT_FROM_TYPE_KEY, "Unknown")
+            text = transcript.get(TRANSCRIPT_TEXT_KEY, "")
+
+            if from_type == FROM_TYPE_USER:
+                label = learner_label(len(learner_messages) + 1)
+                learner_messages[label] = transcript
+                combined_text += f"[{label}] {SPEAKER_USER}: {text}\n"
+            elif from_type == FROM_TYPE_CHARACTER:
+                combined_text += f"{SPEAKER_CHARACTER}: {text}\n"
             else:
-                speaker = from_type
- 
-            text = transcript.get("dialogue_value", "")
-            combined_text += f"{speaker}: {text}\n"
- 
-        return combined_text
+                combined_text += f"{from_type}: {text}\n"
+
+        return combined_text, learner_messages
  
     # ── 3. Call Gemini to generate tips ────────────────────────────────────
     def generate_tips(self, transcript: str,
@@ -588,6 +731,10 @@ class DynamicTips:
             Do NOT evaluate the "AI CHARACTER" messages.
             Do NOT add any preamble, heading, or closing text outside the tip blocks.
             Always keep each tip length to 500 characters or less.
+
+            Each "HUMAN USER" message is labelled [U1], [U2], and so on. Never write these labels in the tip itself.
+            After the tip, on its own final line, name the one message the tip is about and copy the exact words from it that you are commenting on:
+            ANCHOR: U<number> | "<exact words from that message>"
             """
 
             # A PDF SOP rides along as inline data; a text SOP is already in the prompt.
@@ -643,15 +790,23 @@ class DynamicTips:
     def save_tips_to_mongodb(self, simulation_id: str, tips: List[str],
                              sop_file_url: Optional[str] = None,
                              sop_applied: bool = False,
-                             learner_instruction: Optional[Dict[str, Any]] = None) -> bool:
+                             learner_instruction: Optional[Dict[str, Any]] = None,
+                             anchor: Optional[Dict[str, Any]] = None,
+                             last_transcript_id: Any = None) -> List[ObjectId]:
+        """Append the tips to the simulation's document; the new tips' ids, or [] on failure."""
         try:
             timestamp   = datetime.now()
             # Each entry records the SOP it came from, so a tip can be traced back
-            # to the document that produced it.
-            tip_entries = [{"tip": tip, "timestamp": timestamp,
+            # to the document that produced it. The `_id` lets the platform edit,
+            # delete or comment on one tip, and the anchor fields place it on the
+            # transcript (task 295).
+            tip_entries = [{FIELD_TIP_ID: ObjectId(),
+                            "tip": tip, "timestamp": timestamp,
                             "sop_file_url": sop_file_url,
                             "sop_applied": sop_applied,
-                            **cl_provenance(learner_instruction)} for tip in tips]
+                            **cl_provenance(learner_instruction),
+                            **(anchor or {}),
+                            FIELD_LAST_TRANSCRIPT_ID: last_transcript_id} for tip in tips]
 
             result = tips_collection.update_one(
                 {"simulation_id": simulation_id},
@@ -664,11 +819,11 @@ class DynamicTips:
                 },
                 upsert=True,
             )
-            return result.acknowledged
+            return [entry[FIELD_TIP_ID] for entry in tip_entries] if result.acknowledged else []
 
         except Exception as e:
             print(f"Error saving tips to MongoDB: {e}")
-            return False
+            return []
 
     # ── 5. Orchestrate the full pipeline ───────────────────────────────────
     def process_simulation(self, simulation_id: str,
@@ -726,23 +881,31 @@ class DynamicTips:
                   f"generating a generic tip")
         lap("context")
 
-        combined    = self.combine_transcripts(transcripts)
+        combined, learner_messages = self.combine_transcripts(transcripts)
         tips, error, model_used = self.generate_tips(combined, sop_document, learner_instruction)
         lap("gemini")
 
-        saved = False
+        anchor: Dict[str, Any] = {}
         if tips:
-            saved = self.save_tips_to_mongodb(
+            tips, label, excerpt = split_anchor_line(tips)
+            anchor = resolve_anchor(tips, label, excerpt, learner_messages)
+
+        tip_ids: List[ObjectId] = []
+        if tips:
+            tip_ids = self.save_tips_to_mongodb(
                 simulation_id, [tips],
                 sop_file_url=sop_file_url,
                 sop_applied=bool(sop_document),
                 learner_instruction=learner_instruction,
+                anchor=anchor,
+                last_transcript_id=transcripts[-1].get("_id"),
             )
-            if saved and learner_instruction:
-                if background_tasks is not None:
-                    background_tasks.add_task(cl_mark_applied, learner_instruction, simulation_id)
-                else:
-                    cl_mark_applied(learner_instruction, simulation_id)
+        saved = bool(tip_ids)
+        if saved and learner_instruction:
+            if background_tasks is not None:
+                background_tasks.add_task(cl_mark_applied, learner_instruction, simulation_id)
+            else:
+                cl_mark_applied(learner_instruction, simulation_id)
         lap("save")
 
         duration_ms = int((time.perf_counter() - started) * 1000)
@@ -750,7 +913,8 @@ class DynamicTips:
               f"(lookup={timings['lookup']} context={timings['context']} "
               f"gemini={timings['gemini']} save={timings['save']}) "
               f"transcripts={len(transcripts)} sop={bool(sop_document)} cl={bool(learner_instruction)} "
-              f"model={model_used} thinking_budget={GEMINI_THINKING_BUDGET}"
+              f"model={model_used} thinking_budget={GEMINI_THINKING_BUDGET} "
+              f"anchor={anchor.get(FIELD_ANCHOR_METHOD)}"
               + (f" error={error}" if error else ""))
 
         return {
@@ -765,6 +929,10 @@ class DynamicTips:
             "cl_applied":       bool(learner_instruction),
             "duration_ms":      duration_ms,
             "model":            model_used,
+            "tip_id":           str(tip_ids[0]) if tip_ids else None,
+            "anchor_transcript_id": str_or_none(anchor.get(FIELD_ANCHOR_TRANSCRIPT_ID)),
+            "anchor_quote":     anchor.get(FIELD_ANCHOR_QUOTE),
+            "anchor_method":    anchor.get(FIELD_ANCHOR_METHOD),
         }
 
 advisor = DynamicTips()

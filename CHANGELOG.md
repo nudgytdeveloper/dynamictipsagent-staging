@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-13
+
+### Added
+- Each stored tip entry gets an `_id` so the platform can edit, delete or comment on a single tip (task 295)
+- Each stored tip entry records the transcript line it is about: `anchor_transcript_id`, `anchor_quote` (the learner's exact words, for highlighting) and `anchor_method` (`model`, `quote_match` or `latest`), plus `last_transcript_id` at generation time
+- `/tips` response gains `tip_id`, `anchor_transcript_id`, `anchor_quote` and `anchor_method`; the timing log line gains `anchor=`
+
+### Changed
+- Learner messages are labelled `[U1]`, `[U2]`, … in the prompt and the model names the one its tip is about on a trailing `ANCHOR` line, which is stripped before the tip is stored; stored tip text keeps its existing format
+
 ## 2026-10-08
 
 ### Added
