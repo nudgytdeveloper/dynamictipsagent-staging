@@ -479,6 +479,14 @@ FIELD_ANCHOR_QUOTE         = "anchor_quote"
 FIELD_ANCHOR_METHOD        = "anchor_method"
 FIELD_LAST_TRANSCRIPT_ID   = "last_transcript_id"
 
+# The platform finds a simulation's tips by an ObjectId `simulation_id`, and
+# shows the notification bell for a tip whose `is_requested` is false (the
+# learner did not ask for it). The agent used to store the id as a string, so
+# older documents are keyed by a string and new tips are appended to whichever
+# document already exists.
+FIELD_SIMULATION_ID        = "simulation_id"
+FIELD_IS_REQUESTED         = "is_requested"
+
 ANCHOR_METHOD_MODEL       = "model"        # the model's ANCHOR line named a real learner message
 ANCHOR_METHOD_QUOTE_MATCH = "quote_match"  # a phrase quoted in the tip was found in a learner message
 ANCHOR_METHOD_LATEST      = "latest"       # neither: the learner's latest message
@@ -591,6 +599,9 @@ app.add_middleware(
 
 class TipsRequest(BaseModel):
     simulation_id: str
+    # True when the learner asked for the tip, false when the platform
+    # generated it unprompted (the notification bell shows for those).
+    is_requested: bool = False
 
 class TipsResponse(BaseModel):
     simulation_id: str
@@ -615,6 +626,7 @@ class TipsResponse(BaseModel):
     anchor_transcript_id: str | None = None
     anchor_quote: str | None = None
     anchor_method: str | None = None
+    is_requested: bool = False
 
 class DynamicTips:
 
@@ -792,7 +804,8 @@ class DynamicTips:
                              sop_applied: bool = False,
                              learner_instruction: Optional[Dict[str, Any]] = None,
                              anchor: Optional[Dict[str, Any]] = None,
-                             last_transcript_id: Any = None) -> List[ObjectId]:
+                             last_transcript_id: Any = None,
+                             is_requested: bool = False) -> List[ObjectId]:
         """Append the tips to the simulation's document; the new tips' ids, or [] on failure."""
         try:
             timestamp   = datetime.now()
@@ -802,18 +815,20 @@ class DynamicTips:
             # transcript (task 295).
             tip_entries = [{FIELD_TIP_ID: ObjectId(),
                             "tip": tip, "timestamp": timestamp,
+                            FIELD_IS_REQUESTED: is_requested,
                             "sop_file_url": sop_file_url,
                             "sop_applied": sop_applied,
                             **cl_provenance(learner_instruction),
                             **(anchor or {}),
                             FIELD_LAST_TRANSCRIPT_ID: last_transcript_id} for tip in tips]
 
+            simulation_oid = ObjectId(simulation_id)
             result = tips_collection.update_one(
-                {"simulation_id": simulation_id},
+                {FIELD_SIMULATION_ID: {"$in": [simulation_oid, simulation_id]}},
                 {
                     "$push": {"dynamictips": {"$each": tip_entries}},
                     "$setOnInsert": {
-                        "simulation_id": simulation_id,
+                        FIELD_SIMULATION_ID: simulation_oid,
                         "created_at": timestamp,
                     },
                 },
@@ -827,7 +842,8 @@ class DynamicTips:
 
     # ── 5. Orchestrate the full pipeline ───────────────────────────────────
     def process_simulation(self, simulation_id: str,
-                           background_tasks: Optional[BackgroundTasks] = None) -> Dict[str, Any]:
+                           background_tasks: Optional[BackgroundTasks] = None,
+                           is_requested: bool = False) -> Dict[str, Any]:
         """Generate, persist and return one tip for the simulation.
 
         The reads that do not depend on each other run side by side, and the
@@ -899,6 +915,7 @@ class DynamicTips:
                 learner_instruction=learner_instruction,
                 anchor=anchor,
                 last_transcript_id=transcripts[-1].get("_id"),
+                is_requested=is_requested,
             )
         saved = bool(tip_ids)
         if saved and learner_instruction:
@@ -914,7 +931,7 @@ class DynamicTips:
               f"gemini={timings['gemini']} save={timings['save']}) "
               f"transcripts={len(transcripts)} sop={bool(sop_document)} cl={bool(learner_instruction)} "
               f"model={model_used} thinking_budget={GEMINI_THINKING_BUDGET} "
-              f"anchor={anchor.get(FIELD_ANCHOR_METHOD)}"
+              f"anchor={anchor.get(FIELD_ANCHOR_METHOD)} requested={is_requested}"
               + (f" error={error}" if error else ""))
 
         return {
@@ -933,6 +950,7 @@ class DynamicTips:
             "anchor_transcript_id": str_or_none(anchor.get(FIELD_ANCHOR_TRANSCRIPT_ID)),
             "anchor_quote":     anchor.get(FIELD_ANCHOR_QUOTE),
             "anchor_method":    anchor.get(FIELD_ANCHOR_METHOD),
+            "is_requested":     is_requested,
         }
 
 advisor = DynamicTips()
@@ -949,7 +967,8 @@ def get_tips(request: TipsRequest, background_tasks: BackgroundTasks):
         if not request.simulation_id:
             raise HTTPException(status_code=400, detail="simulation_id is required.")
 
-        result = advisor.process_simulation(request.simulation_id, background_tasks)
+        result = advisor.process_simulation(request.simulation_id, background_tasks,
+                                            is_requested=request.is_requested)
         return result
 
     except HTTPException:
@@ -961,12 +980,15 @@ def get_tips(request: TipsRequest, background_tasks: BackgroundTasks):
 
 
 @app.post("/tips/{simulation_id}", response_model=TipsResponse)
-def get_tips_by_id(simulation_id: str, background_tasks: BackgroundTasks):
+def get_tips_by_id(simulation_id: str, background_tasks: BackgroundTasks,
+                   is_requested: bool = False):
     """
     Convenience POST endpoint — same behaviour as /tips but with
-    simulation_id in the URL path instead of the request body.
+    simulation_id in the URL path instead of the request body, and
+    is_requested as a query parameter.
     """
-    result = advisor.process_simulation(simulation_id, background_tasks)
+    result = advisor.process_simulation(simulation_id, background_tasks,
+                                        is_requested=is_requested)
 
     if result.get("error") and not result.get("tips"):
         raise HTTPException(status_code=502, detail=result["error"])
