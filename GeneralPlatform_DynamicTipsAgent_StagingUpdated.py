@@ -1,4 +1,5 @@
 import base64
+import difflib
 import pymongo
 from google import genai
 from google.genai import types as genai_types
@@ -498,30 +499,70 @@ ANCHOR_LINE_PATTERN  = re.compile(r'^\s*\**\s*ANCHOR\s*\**\s*:\s*\**\s*\[?U(\d+)
 LEARNER_LABEL_PATTERN = re.compile(r'\s*\[U\d+\]')
 # Phrases a tip quotes: "…" or “…”.
 TIP_QUOTE_PATTERN     = re.compile(r'"([^"]+)"|“([^”]+)”')
-# Quoted fragments shorter than this match too much to place a tip by.
+# Quoted fragments shorter than this match too much to place a tip by when
+# searching every learner message. Inside the message the model named, any
+# length will do: "hello" is the whole of many opening messages.
 MIN_QUOTE_MATCH_CHARS = 8
+MIN_NAMED_QUOTE_CHARS = 1
 QUOTE_EDGE_CHARS      = " \t\n\"'“”‘’.…,;:!?"
 # One character for one character, so a match position in the folded text is
 # the same position in the original.
 QUOTE_FOLD_TABLE      = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
+# The model sometimes fixes the learner's typos while quoting them ("will that
+# work" for "will taht work"). Inside the named message, a run of the learner's
+# words this similar to the excerpt is taken as the quote, in their spelling.
+FUZZY_QUOTE_MIN_RATIO = 0.85
 
 
 def learner_label(index: int) -> str:
     return f"{LEARNER_LABEL_PREFIX}{index}"
 
 
-def find_excerpt(excerpt: Optional[str], text: str) -> Optional[str]:
-    """The span of `text` that `excerpt` quotes, ignoring case, quote style and
-    spacing; None if it is not there. Returns the original wording, so the
-    platform can highlight it with a plain substring search."""
-    if not excerpt or not text:
-        return None
-    words = excerpt.translate(QUOTE_FOLD_TABLE).strip(QUOTE_EDGE_CHARS).split()
-    if not words or len(" ".join(words)) < MIN_QUOTE_MATCH_CHARS:
+def excerpt_words(excerpt: Optional[str]) -> List[str]:
+    return (excerpt or "").translate(QUOTE_FOLD_TABLE).strip(QUOTE_EDGE_CHARS).split()
+
+
+def find_excerpt(excerpt: Optional[str], text: str,
+                 min_chars: int = MIN_QUOTE_MATCH_CHARS) -> Optional[str]:
+    """The span of `text` that `excerpt` quotes, as whole words, ignoring case,
+    quote style and spacing; None if it is not there. Returns the original
+    wording, so the platform can highlight it with a plain substring search."""
+    words = excerpt_words(excerpt)
+    if not text or not words or len(" ".join(words)) < min_chars:
         return None
     pattern = r"\s+".join(re.escape(word) for word in words)
+    if re.match(r"\w", words[0]):
+        pattern = r"(?<!\w)" + pattern
+    if re.search(r"\w$", words[-1]):
+        pattern = pattern + r"(?!\w)"
     match = re.search(pattern, text.translate(QUOTE_FOLD_TABLE), re.IGNORECASE)
     return text[match.start():match.end()] if match else None
+
+
+def find_excerpt_fuzzy(excerpt: Optional[str], text: str) -> Optional[str]:
+    """The run of words in `text` most like `excerpt`, in the learner's own
+    spelling, when it is at least FUZZY_QUOTE_MIN_RATIO alike; else None."""
+    words = excerpt_words(excerpt)
+    target = " ".join(words).lower()
+    if not text or len(target) < MIN_QUOTE_MATCH_CHARS:
+        return None
+    tokens = list(re.finditer(r"\S+", text.translate(QUOTE_FOLD_TABLE)))
+    best_ratio, best_span = 0.0, None
+    for size in {max(1, len(words) - 1), len(words), len(words) + 1}:
+        for first in range(0, len(tokens) - size + 1):
+            start, end = tokens[first].start(), tokens[first + size - 1].end()
+            candidate = " ".join(t.group() for t in tokens[first:first + size]).strip(QUOTE_EDGE_CHARS)
+            ratio = difflib.SequenceMatcher(None, target, candidate.lower()).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_span = ratio, (start, end)
+    if best_span is None or best_ratio < FUZZY_QUOTE_MIN_RATIO:
+        return None
+    start, end = best_span
+    while start < end and text[start] in QUOTE_EDGE_CHARS:
+        start += 1
+    while end > start and text[end - 1] in QUOTE_EDGE_CHARS:
+        end -= 1
+    return text[start:end] or None
 
 
 def split_anchor_line(tip_text: str) -> Tuple[str, Optional[str], Optional[str]]:
@@ -562,17 +603,18 @@ def resolve_anchor(tip_text: str, label: Optional[str], excerpt: Optional[str],
                 FIELD_ANCHOR_QUOTE: quote,
                 FIELD_ANCHOR_METHOD: method}
 
-    def quote_in(message: Dict[str, Any]) -> Optional[str]:
+    def quote_in(message: Dict[str, Any], min_chars: int = MIN_QUOTE_MATCH_CHARS) -> Optional[str]:
         text = message.get(TRANSCRIPT_TEXT_KEY) or ""
         for phrase in ([excerpt] if excerpt else []) + quoted_phrases(tip_text):
-            found = find_excerpt(phrase, text)
+            found = find_excerpt(phrase, text, min_chars)
             if found:
                 return found
         return None
 
     named = learner_messages.get(label) if label else None
     if named is not None:
-        quote = quote_in(named)
+        quote = (quote_in(named, MIN_NAMED_QUOTE_CHARS)
+                 or find_excerpt_fuzzy(excerpt, named.get(TRANSCRIPT_TEXT_KEY) or ""))
         if quote:
             return anchor(named, ANCHOR_METHOD_MODEL, quote)
 
@@ -745,7 +787,7 @@ class DynamicTips:
             Always keep each tip length to 500 characters or less.
 
             Each "HUMAN USER" message is labelled [U1], [U2], and so on. Never write these labels in the tip itself.
-            After the tip, on its own final line, name the one message the tip is about and copy the exact words from it that you are commenting on:
+            After the tip, on its own final line, name the one message the tip is about and copy the exact words from it that you are commenting on, character for character, keeping any spelling mistakes (never correct or reword them):
             ANCHOR: U<number> | "<exact words from that message>"
             """
 
