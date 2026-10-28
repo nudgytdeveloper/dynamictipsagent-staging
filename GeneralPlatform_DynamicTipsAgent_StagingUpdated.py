@@ -5,7 +5,8 @@ from google import genai
 from google.genai import types as genai_types
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import io
 import os
 import re
 import sys
@@ -20,6 +21,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
+from pypdf import PdfReader
 
 # Render captures stdout through a pipe, where Python block-buffers it: every
 # print of a request used to surface in one clump at the end, so the per-stage
@@ -56,7 +58,8 @@ GEMINI_API_KEY         = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL             = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_THINKING_BUDGET   = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))
 # Bounds a hung generation; the old client would wait on it indefinitely.
-GEMINI_TIMEOUT_SECONDS   = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "60"))
+# The learner never waits this long: see TIPS_HEDGE_SECONDS below.
+GEMINI_TIMEOUT_SECONDS   = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "20"))
 GEMINI_TEMPERATURE       = 0.5
 # Thinking tokens (when a budget is set) are charged against this cap too.
 GEMINI_MAX_OUTPUT_TOKENS = 3000
@@ -70,7 +73,19 @@ GEMINI_MAX_OUTPUT_TOKENS = 3000
 # ============================================================================
 OPENAI_API_KEY           = os.environ.get("OPENAI_API_KEY")
 OPENAI_FALLBACK_MODEL    = os.environ.get("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT_SECONDS   = int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
+OPENAI_TIMEOUT_SECONDS   = int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "20"))
+
+# ============================================================================
+# Hedged request (2026-10-28, Changi trial: "loading time should not be more
+# than 10 seconds"). From 2026-10-26 gemini-3.8-flash mostly answered 503 or
+# hung until the 60 s timeout, and only then did the fallback start, so a tip
+# took 45-83 s. Gemini normally answers in 3-4 s, so if it has not answered
+# within TIPS_HEDGE_SECONDS (or fails sooner) OpenAI is asked as well and the
+# first tip back wins. The slower call is abandoned, not awaited.
+# ============================================================================
+TIPS_HEDGE_SECONDS     = float(os.environ.get("TIPS_HEDGE_SECONDS", "5"))
+TIPS_MODEL_POOL_SIZE   = int(os.environ.get("TIPS_MODEL_POOL_SIZE", "16"))
+_model_pool            = ThreadPoolExecutor(max_workers=TIPS_MODEL_POOL_SIZE)
 
 client                 = pymongo.MongoClient(MONGO_URI)
 db                     = client[DB_NAME]
@@ -159,6 +174,62 @@ def finish_reason(response: Any) -> str:
     return str(getattr(reason, "name", reason) or "unknown")
 
 
+def ask_gemini(contents: List[Any]) -> str:
+    """Gemini's answer; raises on an error or an empty answer."""
+    response = gemini_client().models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=genai_types.GenerateContentConfig(
+            temperature=GEMINI_TEMPERATURE,
+            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+            thinking_config=(genai_types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
+                             if GEMINI_THINKING_BUDGET >= 0 else None),
+        ),
+    )
+    text = response_text(response)
+    if not text:
+        raise RuntimeError(f"Gemini returned no text (finish_reason={finish_reason(response)})")
+    return text
+
+
+def ask_openai(prompt: str, sop_document: Optional[Dict[str, Any]]) -> str:
+    """OpenAI's answer to the same prompt; raises on an error or an empty answer."""
+    text = generate_with_openai(prompt, sop_document)
+    if not text:
+        raise RuntimeError("OpenAI returned no text")
+    return text
+
+
+def first_answer(prompt: str, contents: List[Any],
+                 sop_document: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str], str]:
+    """(text, error, model) from the first model to answer; see TIPS_HEDGE_SECONDS.
+
+    Gemini goes first. OpenAI joins when Gemini fails, or has not answered
+    within the hedge window. Without OPENAI_API_KEY this is a plain Gemini call.
+    """
+    gemini = _model_pool.submit(ask_gemini, contents)
+    wait([gemini], timeout=TIPS_HEDGE_SECONDS)
+    if gemini.done() and gemini.exception() is None:
+        return gemini.result(), None, GEMINI_MODEL
+
+    pending: Dict[Future, str] = {gemini: GEMINI_MODEL}
+    if OPENAI_API_KEY:
+        reason = f"Gemini: {gemini.exception()}"[:300] if gemini.done() else \
+                 f"Gemini has not answered in {TIPS_HEDGE_SECONDS:g}s"
+        print(f"{reason} — asking {OPENAI_FALLBACK_MODEL} too")
+        pending[_model_pool.submit(ask_openai, prompt, sop_document)] = OPENAI_FALLBACK_MODEL
+
+    errors: List[str] = []
+    while pending:
+        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for future in done:
+            model = pending.pop(future)
+            if future.exception() is None:
+                return future.result(), None, model
+            errors.append(f"{model}: {future.exception()}")
+    return "", "; ".join(errors), OPENAI_FALLBACK_MODEL if OPENAI_API_KEY else GEMINI_MODEL
+
+
 # ============================================================================
 # SOP / reference documents (task 307, "Tips based on SOP or documents").
 #
@@ -183,6 +254,12 @@ SOP_MAX_BYTES     = 15 * 1024 * 1024   # keep the request under Gemini's inline-
 SOP_PDF_MIME      = "application/pdf"
 SOP_PDF_EXTENSIONS  = (".pdf",)
 SOP_TEXT_EXTENSIONS = (".txt", ".md")
+# A PDF SOP is sent as its text when it has at least this much (2026-10-28).
+# Both models read an attached PDF page by page as images on every request:
+# Changi's 89-page, 4 MB RTS deck holds only ~15k characters of text, yet with
+# it attached Gemini took 11-14 s and gpt-4o-mini ~23 s. Below the threshold
+# (a scanned PDF) the file itself is still attached.
+SOP_PDF_MIN_TEXT_CHARS = int(os.environ.get("SOP_PDF_MIN_TEXT_CHARS", "500"))
 
 
 def _first_file_url(value: Any) -> Optional[str]:
@@ -346,11 +423,22 @@ def _encode_url(url: str) -> str:
     ))
 
 
+def pdf_text(payload: bytes) -> str:
+    """The PDF's extractable text, or "" for a scanned or unreadable file. Never raises."""
+    try:
+        reader = PdfReader(io.BytesIO(payload))
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception as e:
+        print(f"Could not read text from SOP PDF: {e}")
+        return ""
+
+
 def fetch_sop_document(url: str) -> Optional[Dict[str, Any]]:
     """Download the SOP file and return a part Gemini can consume.
 
-    Returns {"url", "mime_type", "data"} for a PDF, {"url", "text"} for plain
-    text, or None if the file is unreachable, oversized, or an unsupported type.
+    Returns {"url", "text"} for plain text or a PDF with enough text, {"url",
+    "mime_type", "data"} for a PDF without, or None if the file is unreachable,
+    oversized, or an unsupported type.
     Never raises: a bad SOP file must not cost the simulation its tips.
     """
     try:
@@ -387,6 +475,10 @@ def fetch_sop_document(url: str) -> Optional[Dict[str, Any]]:
         return None
 
     if is_pdf:
+        text = pdf_text(payload)
+        if len(text) >= SOP_PDF_MIN_TEXT_CHARS:
+            return {"url": url, "text": text}
+        print(f"SOP file {url} has {len(text)} characters of text — attaching the PDF itself")
         return {"url": url, "mime_type": SOP_PDF_MIME, "data": payload}
 
     try:
@@ -798,36 +890,9 @@ class DynamicTips:
                     data=sop_document["data"], mime_type=sop_document["mime_type"]))
             contents.append(prompt)
 
-            tips_text, gemini_error = "", None
-            try:
-                response = gemini_client().models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=GEMINI_TEMPERATURE,
-                        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                        thinking_config=(genai_types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
-                                         if GEMINI_THINKING_BUDGET >= 0 else None),
-                    ),
-                )
-                tips_text = response_text(response)
-                if not tips_text:
-                    gemini_error = f"Gemini returned no text (finish_reason={finish_reason(response)})"
-            except Exception as e:
-                gemini_error = f"Gemini: {e}"
-
-            if not tips_text and OPENAI_API_KEY:
-                print(f"{gemini_error[:300]} — falling back to {OPENAI_FALLBACK_MODEL}")
-                model_used = OPENAI_FALLBACK_MODEL
-                try:
-                    tips_text = generate_with_openai(prompt, sop_document)
-                    if not tips_text:
-                        gemini_error = f"{gemini_error}; OpenAI returned no text"
-                except Exception as e:
-                    gemini_error = f"{gemini_error}; OpenAI: {e}"
-
+            tips_text, model_error, model_used = first_answer(prompt, contents, sop_document)
             if not tips_text:
-                return "", f"Error generating tips: {gemini_error}", model_used
+                return "", f"Error generating tips: {model_error}", model_used
 
             # FIX: Split on double newlines so each full tip block is one list item,
             # rather than splitting on every newline which fragments tips into individual lines.

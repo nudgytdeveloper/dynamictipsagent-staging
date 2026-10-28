@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-28
+
+### Fixed
+- When Gemini has not answered within `TIPS_HEDGE_SECONDS` (5 s) or fails sooner, OpenAI is asked too and the first tip back is returned; Gemini and OpenAI timeouts default to 20 s (were 60 s)
+
+### Changed
+- A PDF SOP with at least `SOP_PDF_MIN_TEXT_CHARS` (500) characters of text is sent to the model as text, not as the PDF; `pypdf` added
+
 ## 2026-10-26
 
 ### Fixed

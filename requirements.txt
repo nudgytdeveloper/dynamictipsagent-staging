@@ -4,3 +4,4 @@ pymongo
 google-genai
 pydantic
 openai
+pypdf
