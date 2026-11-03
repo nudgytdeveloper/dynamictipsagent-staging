@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-03
+
+### Fixed
+- Coaching sessions get coaching tips: the learner is talking to their own coach, so honest worries are never called self-critical or something to hide (task 680)
+- Tips never comment on spelling, and quote the learner with obvious typos fixed; the anchor quote still keeps their exact words (task 680)
+
+### Changed
+- Coach turns are labelled "AI COACH" in the prompt instead of the raw "Coach" (task 680)
+
 ## 2026-10-28
 
 ### Fixed
@@ -24,6 +33,11 @@
 
 ### Fixed
 - New tip documents store `simulation_id` as an ObjectId, which the platform reads; tips for a simulation are appended to its existing document whether it is keyed by an ObjectId or the older string
+
+## 2026-10-20
+
+### Fixed
+- SOP instructions about smiling, nodding, eye contact or tone are skipped; the transcript cannot show them (task 531)
 
 ## 2026-10-13
 

@@ -562,9 +562,18 @@ TRANSCRIPT_FROM_TYPE_KEY  = "from_type"
 TRANSCRIPT_TEXT_KEY       = "dialogue_value"
 FROM_TYPE_USER            = "User"
 FROM_TYPE_CHARACTER       = "Character"
+FROM_TYPE_COACH           = "Coach"
 SPEAKER_USER              = "HUMAN USER"
 SPEAKER_CHARACTER         = "AI CHARACTER"
+SPEAKER_COACH             = "AI COACH"
 LEARNER_LABEL_PREFIX      = "U"
+
+# A coaching session (task 680): the learner talks to their own AI coach, not
+# to a customer in a roleplay. The service's simulation type records the stage;
+# a coach turn in the transcript is the fallback when the snapshot lacks it.
+SIM_TYPE_KEY       = "simulation_type"
+SIM_TYPE_STAGE_KEY = "stage"
+STAGE_COACHING     = "Coaching"
 
 FIELD_TIP_ID               = "_id"
 FIELD_ANCHOR_TRANSCRIPT_ID = "anchor_transcript_id"
@@ -608,6 +617,61 @@ FUZZY_QUOTE_MIN_RATIO = 0.85
 
 def learner_label(index: int) -> str:
     return f"{LEARNER_LABEL_PREFIX}{index}"
+
+
+def is_coaching_session(simulation: Optional[Dict[str, Any]],
+                        transcripts: List[Dict[str, Any]]) -> bool:
+    """True when the learner is being coached rather than playing a roleplay.
+
+    The recorded stage decides; a coach turn in the transcript counts only when
+    the snapshot has no stage.
+    """
+    snapshot = (simulation or {}).get(SNAPSHOT_KEY) or {}
+    sim_type = snapshot.get(SIM_TYPE_KEY) if isinstance(snapshot, dict) else None
+    stage = sim_type.get(SIM_TYPE_STAGE_KEY) if isinstance(sim_type, dict) else None
+    if stage:
+        return stage == STAGE_COACHING
+    return any(t.get(TRANSCRIPT_FROM_TYPE_KEY) == FROM_TYPE_COACH for t in transcripts)
+
+
+# How the tip is framed. A roleplay tip judges the effect on the other person;
+# a coaching tip helps the learner get more out of their own coach, where being
+# open about a worry is the point, not a weakness (task 680: a tip told a learner
+# that admitting stage fright "might come off as self-critical").
+ROLEPLAY_FRAMING = {
+    "intro": "Analyze ONLY the \"HUMAN USER\" messages in this conversation transcript:",
+    "goal": ("Identify specific moments where the learner's communication style could be adjusted for "
+             "better rapport, clarity, or empathy — then give immediately actionable tips they can apply "
+             "in their very next message or real-world conversation."),
+    "effect": "Explain what effect it likely had on the other person",
+    "why_line": "💬 Why it matters: [impact on the listener/relationship]",
+    "focus": "Focus on: tone, word choice, empathy signals, question framing, and clarity of intent.",
+    "ignore": "Do NOT evaluate the \"AI CHARACTER\" messages.",
+}
+COACHING_FRAMING = {
+    "intro": ("This is a one-to-one coaching session: the learner (\"HUMAN USER\") is talking to their own "
+              "AI coach (\"AI COACH\"), not to a customer, colleague or audience. Analyze ONLY the "
+              "\"HUMAN USER\" messages in this transcript:"),
+    "goal": ("Identify one moment where the learner could get more out of this coaching, then give a tip "
+             "they can use in their very next message to the coach. Good coaching tips help the learner "
+             "be specific about their situation, say what they want to achieve, turn an idea into a "
+             "concrete next step, or ask the coach for what they need.\n"
+             "            Being open with the coach about worries, doubts, nerves or weaknesses is exactly what "
+             "coaching needs. Never call it self-critical, negative or a sign of weakness, never suggest it "
+             "makes them look vulnerable, and never tell them to hide it or reframe it more positively."),
+    "effect": "Explain how the change would help them get more from the coaching",
+    "why_line": "💬 Why it matters: [how it helps them get more from the coaching]",
+    "focus": "Focus on: specificity, goals, next steps, and what to ask the coach for.",
+    "ignore": "Do NOT evaluate the \"AI COACH\" messages.",
+}
+
+# Learners type fast; a dropped letter is not a communication problem, and
+# quoting one back reads as mockery (task 680: "onestly ... people stae at me").
+SPELLING_RULE = (
+    "Spelling mistakes and missing letters are typing slips, not communication problems: never comment on "
+    "them. When the tip quotes the learner, fix obvious typos in the quote. The ANCHOR line below is the "
+    "only place that keeps their exact spelling."
+)
 
 
 def excerpt_words(excerpt: Optional[str]) -> List[str]:
@@ -816,6 +880,8 @@ class DynamicTips:
                 combined_text += f"[{label}] {SPEAKER_USER}: {text}\n"
             elif from_type == FROM_TYPE_CHARACTER:
                 combined_text += f"{SPEAKER_CHARACTER}: {text}\n"
+            elif from_type == FROM_TYPE_COACH:
+                combined_text += f"{SPEAKER_COACH}: {text}\n"
             else:
                 combined_text += f"{from_type}: {text}\n"
 
@@ -824,9 +890,11 @@ class DynamicTips:
     # ── 3. Call Gemini to generate tips ────────────────────────────────────
     def generate_tips(self, transcript: str,
                       sop_document: Optional[Dict[str, Any]] = None,
-                      learner_instruction: Optional[Dict[str, Any]] = None) -> Tuple[str, str | None, str]:
+                      learner_instruction: Optional[Dict[str, Any]] = None,
+                      coaching: bool = False) -> Tuple[str, str | None, str]:
         """Return (tips, error, model that answered)."""
         model_used = GEMINI_MODEL
+        framing = COACHING_FRAMING if coaching else ROLEPLAY_FRAMING
         try:
             # When the service has an SOP / best-practice document attached, the
             # tip is drawn from that document's specific instructions instead of
@@ -850,6 +918,7 @@ class DynamicTips:
             - State what the SOP requires, using its own wording where it helps.
             - Give the learner the specific phrasing or action the SOP calls for.
             - Ignore any part of the SOP the conversation gave them no occasion to apply.
+            - Ignore SOP instructions about behaviour that can only be seen or heard (smiling, nodding, eye contact, tone): the transcript cannot show it.
             - If they followed the SOP throughout, fall back to a general communication tip.
             """
 
@@ -857,24 +926,25 @@ class DynamicTips:
             You are a communication coach helping learners in Singapore improve their interpersonal effectiveness.
             {sop_instruction}
             {learner_instruction_block(learner_instruction)}
-            Analyze ONLY the "HUMAN USER" messages in this conversation transcript:
+            {framing['intro']}
             {transcript}
 
-            Identify specific moments where the learner's communication style could be adjusted for better rapport, clarity, or empathy — then give immediately actionable tips they can apply in their very next message or real-world conversation.
+            {framing['goal']}
 
             For each tip:
-            1. Quote or reference the exact message or pattern you observed
-            2. Explain what effect it likely had on the other person
+            1. Quote or reference the message or pattern you observed
+            2. {framing['effect']}
             3. Give a concrete alternative phrasing or behavior they can use right away
 
             Provide 1 tip. Format each tip as a single self-contained block separated by a blank line:
 
             🔍 What I noticed: [specific behavior]
-            💬 Why it matters: [impact on the listener/relationship]
+            {framing['why_line']}
             ✅ Try this instead: [ready-to-use alternative]
 
-            Focus on: tone, word choice, empathy signals, question framing, and clarity of intent.
-            Do NOT evaluate the "AI CHARACTER" messages.
+            {framing['focus']}
+            {SPELLING_RULE}
+            {framing['ignore']}
             Do NOT add any preamble, heading, or closing text outside the tip blocks.
             Always keep each tip length to 500 characters or less.
 
@@ -1005,7 +1075,8 @@ class DynamicTips:
         lap("context")
 
         combined, learner_messages = self.combine_transcripts(transcripts)
-        tips, error, model_used = self.generate_tips(combined, sop_document, learner_instruction)
+        coaching = is_coaching_session(simulation, transcripts)
+        tips, error, model_used = self.generate_tips(combined, sop_document, learner_instruction, coaching)
         lap("gemini")
 
         anchor: Dict[str, Any] = {}
