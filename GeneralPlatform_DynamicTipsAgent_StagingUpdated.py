@@ -82,8 +82,11 @@ OPENAI_TIMEOUT_SECONDS   = int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "20"))
 # took 45-83 s. Gemini normally answers in 3-4 s, so if it has not answered
 # within TIPS_HEDGE_SECONDS (or fails sooner) OpenAI is asked as well and the
 # first tip back wins. The slower call is abandoned, not awaited.
+#
+# Task 681 (2026-11-04): timed runs had tips at 2.4-3.6 s, and the target is
+# under 3 s, so a slow Gemini now gets company after 3 s instead of 5 s.
 # ============================================================================
-TIPS_HEDGE_SECONDS     = float(os.environ.get("TIPS_HEDGE_SECONDS", "5"))
+TIPS_HEDGE_SECONDS     = float(os.environ.get("TIPS_HEDGE_SECONDS", "3"))
 TIPS_MODEL_POOL_SIZE   = int(os.environ.get("TIPS_MODEL_POOL_SIZE", "16"))
 _model_pool            = ThreadPoolExecutor(max_workers=TIPS_MODEL_POOL_SIZE)
 
@@ -568,6 +571,13 @@ SPEAKER_CHARACTER         = "AI CHARACTER"
 SPEAKER_COACH             = "AI COACH"
 LEARNER_LABEL_PREFIX      = "U"
 
+# Task 681 (2026-11-04): the whole conversation went into every tip request, so
+# each tip got slower as the session went on. Only the latest messages are sent
+# now; labels still count from the start, so [U7] is the same message in every
+# tip. 0 sends the whole conversation.
+TIPS_TRANSCRIPT_MAX_MESSAGES = int(os.environ.get("TIPS_TRANSCRIPT_MAX_MESSAGES", "30"))
+TRANSCRIPT_OMITTED_NOTE      = "(earlier messages omitted)"
+
 # A coaching session (task 680): the learner talks to their own AI coach, not
 # to a customer in a roleplay. The service's simulation type records the stage;
 # a coach turn in the transcript is the fallback when the snapshot lacks it.
@@ -866,9 +876,10 @@ class DynamicTips:
         """(prompt transcript, {label: transcript doc} for the learner's messages).
 
         Each learner message is labelled [U1], [U2], … so the model can say
-        which one its tip is about (task 295).
+        which one its tip is about (task 295). Only the last
+        TIPS_TRANSCRIPT_MAX_MESSAGES messages go into the prompt.
         """
-        combined_text = ""
+        lines: List[str] = []
         learner_messages: Dict[str, Dict[Any, Any]] = {}
         for transcript in transcripts:
             from_type = transcript.get(TRANSCRIPT_FROM_TYPE_KEY, "Unknown")
@@ -877,15 +888,17 @@ class DynamicTips:
             if from_type == FROM_TYPE_USER:
                 label = learner_label(len(learner_messages) + 1)
                 learner_messages[label] = transcript
-                combined_text += f"[{label}] {SPEAKER_USER}: {text}\n"
+                lines.append(f"[{label}] {SPEAKER_USER}: {text}\n")
             elif from_type == FROM_TYPE_CHARACTER:
-                combined_text += f"{SPEAKER_CHARACTER}: {text}\n"
+                lines.append(f"{SPEAKER_CHARACTER}: {text}\n")
             elif from_type == FROM_TYPE_COACH:
-                combined_text += f"{SPEAKER_COACH}: {text}\n"
+                lines.append(f"{SPEAKER_COACH}: {text}\n")
             else:
-                combined_text += f"{from_type}: {text}\n"
+                lines.append(f"{from_type}: {text}\n")
 
-        return combined_text, learner_messages
+        if 0 < TIPS_TRANSCRIPT_MAX_MESSAGES < len(lines):
+            lines = [f"{TRANSCRIPT_OMITTED_NOTE}\n"] + lines[-TIPS_TRANSCRIPT_MAX_MESSAGES:]
+        return "".join(lines), learner_messages
  
     # ── 3. Call Gemini to generate tips ────────────────────────────────────
     def generate_tips(self, transcript: str,

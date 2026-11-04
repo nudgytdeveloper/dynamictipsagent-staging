@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-04
+
+### Changed
+- OpenAI is asked as well when Gemini has not answered within 3 s (`TIPS_HEDGE_SECONDS`, was 5 s) (task 681)
+- Only the last `TIPS_TRANSCRIPT_MAX_MESSAGES` (30) messages go into each tip prompt; labels still count from the start (task 681)
+
 ## 2026-11-03
 
 ### Fixed
