@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-06
+
+### Changed
+- Gemini and OpenAI are asked at the same time and the first tip back wins (`TIPS_HEDGE_SECONDS` default 0, was 3 s) (task 681)
+- SOP files stay cached for 30 min (`SOP_CACHE_TTL_SECONDS`, was 10 min) (task 681)
+
 ## 2026-11-04
 
 ### Changed

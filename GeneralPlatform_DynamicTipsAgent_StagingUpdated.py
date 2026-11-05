@@ -85,8 +85,13 @@ OPENAI_TIMEOUT_SECONDS   = int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "20"))
 #
 # Task 681 (2026-11-04): timed runs had tips at 2.4-3.6 s, and the target is
 # under 3 s, so a slow Gemini now gets company after 3 s instead of 5 s.
+#
+# Task 681 (2026-11-06): on staging every tip still came from gpt-4o-mini, at
+# 2.5-3.6 s: Gemini failed or stalled each time and OpenAI only started once it
+# did. Both are now asked at once (0) and the first answer wins. A positive
+# value brings back the wait-then-hedge behaviour.
 # ============================================================================
-TIPS_HEDGE_SECONDS     = float(os.environ.get("TIPS_HEDGE_SECONDS", "3"))
+TIPS_HEDGE_SECONDS     = float(os.environ.get("TIPS_HEDGE_SECONDS", "0"))
 TIPS_MODEL_POOL_SIZE   = int(os.environ.get("TIPS_MODEL_POOL_SIZE", "16"))
 _model_pool            = ThreadPoolExecutor(max_workers=TIPS_MODEL_POOL_SIZE)
 
@@ -208,15 +213,19 @@ def first_answer(prompt: str, contents: List[Any],
     """(text, error, model) from the first model to answer; see TIPS_HEDGE_SECONDS.
 
     Gemini goes first. OpenAI joins when Gemini fails, or has not answered
-    within the hedge window. Without OPENAI_API_KEY this is a plain Gemini call.
+    within the hedge window; with no window both start together. Without
+    OPENAI_API_KEY this is a plain Gemini call.
     """
     gemini = _model_pool.submit(ask_gemini, contents)
-    wait([gemini], timeout=TIPS_HEDGE_SECONDS)
-    if gemini.done() and gemini.exception() is None:
-        return gemini.result(), None, GEMINI_MODEL
-
     pending: Dict[Future, str] = {gemini: GEMINI_MODEL}
-    if OPENAI_API_KEY:
+    if OPENAI_API_KEY and TIPS_HEDGE_SECONDS <= 0:
+        pending[_model_pool.submit(ask_openai, prompt, sop_document)] = OPENAI_FALLBACK_MODEL
+    else:
+        wait([gemini], timeout=TIPS_HEDGE_SECONDS)
+        if gemini.done() and gemini.exception() is None:
+            return gemini.result(), None, GEMINI_MODEL
+
+    if OPENAI_API_KEY and len(pending) == 1:
         reason = f"Gemini: {gemini.exception()}"[:300] if gemini.done() else \
                  f"Gemini has not answered in {TIPS_HEDGE_SECONDS:g}s"
         print(f"{reason} — asking {OPENAI_FALLBACK_MODEL} too")
@@ -502,8 +511,10 @@ def fetch_sop_document(url: str) -> Optional[Dict[str, Any]]:
 # unusable result (unreachable, oversized, wrong type) is cached too, but
 # only briefly, so a transient outage does not cost ten minutes of SOP-less
 # tips. Keyed on the URL alone: an admin re-uploading under the *same*
-# filename is served the old file until the entry expires.
-SOP_CACHE_TTL_SECONDS         = int(os.environ.get("SOP_CACHE_TTL_SECONDS", "600"))
+# filename is served the old file until the entry expires. Task 681: 30 min
+# (was 10) so a tip late in a long session does not download and parse the
+# SOP again.
+SOP_CACHE_TTL_SECONDS         = int(os.environ.get("SOP_CACHE_TTL_SECONDS", "1800"))
 SOP_CACHE_FAILURE_TTL_SECONDS = int(os.environ.get("SOP_CACHE_FAILURE_TTL_SECONDS", "60"))
 SOP_CACHE_MAX_ENTRIES         = 32
 
