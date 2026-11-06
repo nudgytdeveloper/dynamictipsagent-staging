@@ -4,6 +4,7 @@
 
 ### Added
 - Each tip follows trainer feedback on the learner's earlier attempts at the same scenario: tips the trainer rewrote or removed, comments on tips and comments on transcript lines, newest first, at most `TRAINER_FEEDBACK_MAX_ITEMS` (10); the learner's own edits and comments are not counted (task 295)
+- When the trainer asked the learner to say or do something not yet done in the conversation, the tip is about that and its ✅ line uses the trainer's words (task 295)
 - `trainer_feedback_ids` on each stored tip entry and `trainer_feedback_applied` on the `/tips` response; the timing log line gains `trainer_feedback=`
 
 ### Changed

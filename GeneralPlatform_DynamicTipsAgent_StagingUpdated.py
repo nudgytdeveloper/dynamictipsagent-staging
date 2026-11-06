@@ -555,17 +555,35 @@ FEEDBACK_LINE_TEMPLATES = {
 }
 
 
+# Staging, 2026-11-06 (gpt-4o-mini, 20 runs per wording): told only that the
+# trainer "outranks" its own view, the model followed "say potato" 2 times in
+# 6 and wrote its usual tip; moved to the end of the prompt, 0 in 6. Making
+# the trainer's request the tip's job, and repeating it as the last rule with
+# the exact words required, followed it 20 times in 20, and "ask for their
+# name" 10 in 10, while comments that ask for nothing ("wow", "test") never
+# took over a tip.
+TRAINER_FEEDBACK_REMINDER = (
+    "Remember: if the trainer feedback above still asks the learner for something, your one tip is about that, "
+    "and the ✅ line must contain the exact words the trainer asked the learner to say."
+)
+
+
 def trainer_feedback_block(items: List[Dict[str, Any]]) -> str:
     """Prompt block for the trainer's feedback; empty when there is none."""
     if not items:
         return ""
     lines = "\n            ".join(FEEDBACK_LINE_TEMPLATES[i["kind"]].format(**i) for i in items)
     return f"""
-            A human trainer reviewed this learner's earlier attempts at this scenario and left the feedback below, newest first. The trainer's judgement outranks the SOP, the background above and your own: when the feedback bears on this conversation, the tip must follow it, steer the learner toward anything the trainer asked for, never repeat advice the trainer removed, and match the way the trainer rewrote a tip. Never mention the trainer or this feedback.
+            YOUR MAIN JOB FOR THIS TIP: a human trainer reviewed this learner's earlier attempts at this scenario and left the feedback below, newest first. The trainer knows this scenario and this learner, so follow a request even when it seems unusual to you.
             ---
             {lines}
             ---
+            Work through the feedback in order. Take the first item that asks the learner to say or do something they have not yet said or done in this conversation: your tip is about that one item. "What I noticed" says they have not done it yet; "Try this instead" gives a ready-to-use message that does exactly what the trainer asked, using the trainer's words. Skip items that ask for nothing (praise, a reaction, "test"). Only if no item is left to act on, write an ordinary tip, never repeating a tip the trainer removed and writing it the way the trainer rewrote tips. Speak as if the advice is your own: never write the words "trainer", "feedback" or "suggestion" in the tip.
             """
+
+
+def trainer_feedback_reminder(items: List[Dict[str, Any]]) -> str:
+    return TRAINER_FEEDBACK_REMINDER if items else ""
 
 
 def _encode_url(url: str) -> str:
@@ -1126,6 +1144,7 @@ class DynamicTips:
             {framing['ignore']}
             Do NOT add any preamble, heading, or closing text outside the tip blocks.
             Always keep each tip length to 500 characters or less.
+            {trainer_feedback_reminder(trainer_feedback or [])}
 
             Each "HUMAN USER" message is labelled [U1], [U2], and so on. Never write these labels in the tip itself.
             After the tip, on its own final line, name the one message the tip is about and copy the exact words from it that you are commenting on, character for character, keeping any spelling mistakes (never correct or reword them):
