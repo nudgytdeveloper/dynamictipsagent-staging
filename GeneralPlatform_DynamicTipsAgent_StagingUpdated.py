@@ -417,6 +417,157 @@ def cl_mark_applied(doc, simulation_id):
 # --- end Continuous Learning consumer helper ---
 
 
+# ============================================================================
+# Trainer feedback (task 295, "Tips reflected against Transcript").
+#
+# After an attempt a trainer can rewrite, delete or comment on a tip (Umbra
+# stores this on the tip entry, by its `_id`) and comment on a transcript line
+# (`transcripts.comments`). The ticket's test: the trainer writes "say potato"
+# on the learner's attempt, the learner tries again, and a tip mentions potato.
+# So every tip reads what trainers left on this learner's attempts at the same
+# scenario, newest first.
+#
+# The platform records trainers and learners alike as from_type "User", and a
+# learner can edit or comment on their own tips, so feedback counts only when
+# its author is not the simulation's learner. An item with no author is left
+# out: there is no telling whose it is.
+# ============================================================================
+TRAINER_FEEDBACK_MAX_ITEMS       = int(os.environ.get("TRAINER_FEEDBACK_MAX_ITEMS", "10"))
+TRAINER_FEEDBACK_MAX_SIMULATIONS = 20    # the learner's most recent attempts at the scenario searched
+TRAINER_FEEDBACK_MAX_CHARS       = 300   # per quoted text, so one long tip cannot crowd out the rest
+
+TIP_TEXT_KEY           = "tip"
+TIP_EDITED_KEY         = "edited_tip"
+TIP_EDITED_BY_KEY      = "edited_by"
+TIP_EDITED_AT_KEY      = "edited_at"
+TIP_DELETED_AT_KEY     = "deleted_at"
+TIP_DELETED_BY_KEY     = "deleted_by"
+TIPS_ARRAY_KEY         = "dynamictips"
+COMMENTS_KEY           = "comments"
+COMMENT_ID_KEY         = "_id"
+COMMENT_FROM_KEY       = "from"
+COMMENT_TEXT_KEY       = "text"
+COMMENT_CREATED_AT_KEY = "created_at"
+TRANSCRIPT_SIMULATION_KEY = "simulation"
+
+FEEDBACK_LINE_COMMENT = "line_comment"   # a comment on one of the learner's transcript lines
+FEEDBACK_TIP_COMMENT  = "tip_comment"    # a comment on an earlier tip
+FEEDBACK_TIP_EDIT     = "tip_edit"       # an earlier tip, rewritten by the trainer
+FEEDBACK_TIP_DELETE   = "tip_delete"     # an earlier tip the trainer removed
+
+FIELD_TRAINER_FEEDBACK_IDS = "trainer_feedback_ids"
+
+
+def id_variants(value: Any) -> List[Any]:
+    """The forms an id may be stored in: as given, as a string, as an ObjectId."""
+    variants = [value, str(value)]
+    try:
+        variants.append(ObjectId(str(value)))
+    except Exception:
+        pass
+    return variants
+
+
+def clip(text: Any, limit: int = TRAINER_FEEDBACK_MAX_CHARS) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
+
+
+def by_trainer(author: Any, learner_id: Any) -> bool:
+    return author is not None and str(author) != str(learner_id)
+
+
+def feedback_item(item_id: Any, kind: str, at: Any, text: Any, about: Any) -> Dict[str, Any]:
+    return {"id": item_id, "kind": kind, "at": at, "text": clip(text), "about": clip(about)}
+
+
+def tip_feedback(entry: Dict[str, Any], learner_id: Any) -> List[Dict[str, Any]]:
+    """What trainers did to one stored tip: removed it, or rewrote it, and any comments."""
+    items: List[Dict[str, Any]] = []
+    original = entry.get(TIP_TEXT_KEY)
+    edited = entry.get(TIP_EDITED_KEY)
+    shown = edited or original
+    if entry.get(TIP_DELETED_AT_KEY) is not None:
+        if by_trainer(entry.get(TIP_DELETED_BY_KEY), learner_id):
+            items.append(feedback_item(entry.get(FIELD_TIP_ID), FEEDBACK_TIP_DELETE,
+                                       entry.get(TIP_DELETED_AT_KEY), shown, shown))
+    elif edited and edited != original and by_trainer(entry.get(TIP_EDITED_BY_KEY), learner_id):
+        items.append(feedback_item(entry.get(FIELD_TIP_ID), FEEDBACK_TIP_EDIT,
+                                   entry.get(TIP_EDITED_AT_KEY), edited, original))
+    for comment in entry.get(COMMENTS_KEY) or []:
+        if comment.get(COMMENT_TEXT_KEY) and by_trainer(comment.get(COMMENT_FROM_KEY), learner_id):
+            items.append(feedback_item(comment.get(COMMENT_ID_KEY), FEEDBACK_TIP_COMMENT,
+                                       comment.get(COMMENT_CREATED_AT_KEY), comment[COMMENT_TEXT_KEY], shown))
+    return items
+
+
+def line_feedback(transcript: Dict[str, Any], learner_id: Any) -> List[Dict[str, Any]]:
+    """Trainer comments on one transcript line."""
+    return [feedback_item(comment.get(COMMENT_ID_KEY), FEEDBACK_LINE_COMMENT,
+                          comment.get(COMMENT_CREATED_AT_KEY), comment[COMMENT_TEXT_KEY],
+                          transcript.get(TRANSCRIPT_TEXT_KEY))
+            for comment in transcript.get(COMMENTS_KEY) or []
+            if comment.get(COMMENT_TEXT_KEY) and by_trainer(comment.get(COMMENT_FROM_KEY), learner_id)]
+
+
+def newest_first(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Newest first; an item with no time goes last."""
+    dated = sorted((i for i in items if isinstance(i["at"], datetime)),
+                   key=lambda i: i["at"].replace(tzinfo=None), reverse=True)
+    return dated + [i for i in items if not isinstance(i["at"], datetime)]
+
+
+def get_trainer_feedback(simulation: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Trainer feedback on this learner's attempts at this simulation's scenario,
+    newest first, at most TRAINER_FEEDBACK_MAX_ITEMS. Never raises."""
+    try:
+        learner_id = next((simulation.get(k) for k in CL_SIM_LEARNER_KEYS
+                           if simulation and simulation.get(k) is not None), None)
+        service_level = (simulation or {}).get(SIM_SERVICE_LEVEL_KEY)
+        if learner_id is None or service_level is None:
+            return []
+        attempts = simulations_collection.find(
+            {"$or": [{key: {"$in": id_variants(learner_id)}} for key in CL_SIM_LEARNER_KEYS],
+             SIM_SERVICE_LEVEL_KEY: {"$in": id_variants(service_level)}},
+            {"_id": 1}).sort("_id", pymongo.DESCENDING).limit(TRAINER_FEEDBACK_MAX_SIMULATIONS)
+        simulation_ids = [v for attempt in attempts for v in id_variants(attempt["_id"])]
+        if not simulation_ids:
+            return []
+        items: List[Dict[str, Any]] = []
+        for doc in tips_collection.find({FIELD_SIMULATION_ID: {"$in": simulation_ids}}, {TIPS_ARRAY_KEY: 1}):
+            for entry in doc.get(TIPS_ARRAY_KEY) or []:
+                items.extend(tip_feedback(entry, learner_id))
+        for transcript in transcripts_collection.find(
+                {TRANSCRIPT_SIMULATION_KEY: {"$in": simulation_ids}, f"{COMMENTS_KEY}.0": {"$exists": True}},
+                {TRANSCRIPT_TEXT_KEY: 1, COMMENTS_KEY: 1}):
+            items.extend(line_feedback(transcript, learner_id))
+        return newest_first(items)[:TRAINER_FEEDBACK_MAX_ITEMS]
+    except Exception as e:
+        print(f"[DEBUG] Trainer feedback lookup failed: {e}")
+        return []
+
+
+FEEDBACK_LINE_TEMPLATES = {
+    FEEDBACK_LINE_COMMENT: '- On the learner\'s line "{about}", the trainer commented: "{text}"',
+    FEEDBACK_TIP_COMMENT:  '- On an earlier tip ("{about}"), the trainer commented: "{text}"',
+    FEEDBACK_TIP_EDIT:     '- The trainer rewrote an earlier tip. Before: "{about}" After: "{text}"',
+    FEEDBACK_TIP_DELETE:   '- The trainer removed this earlier tip; do not give it, or anything like it, again: "{text}"',
+}
+
+
+def trainer_feedback_block(items: List[Dict[str, Any]]) -> str:
+    """Prompt block for the trainer's feedback; empty when there is none."""
+    if not items:
+        return ""
+    lines = "\n            ".join(FEEDBACK_LINE_TEMPLATES[i["kind"]].format(**i) for i in items)
+    return f"""
+            A human trainer reviewed this learner's earlier attempts at this scenario and left the feedback below, newest first. The trainer's judgement outranks the SOP, the background above and your own: when the feedback bears on this conversation, the tip must follow it, steer the learner toward anything the trainer asked for, never repeat advice the trainer removed, and match the way the trainer rewrote a tip. Never mention the trainer or this feedback.
+            ---
+            {lines}
+            ---
+            """
+
+
 def _encode_url(url: str) -> str:
     """Percent-encode the path/query of a URL.
 
@@ -846,6 +997,8 @@ class TipsResponse(BaseModel):
     anchor_quote: str | None = None
     anchor_method: str | None = None
     is_requested: bool = False
+    # How many trainer edits, removals and comments on earlier attempts shaped the tip.
+    trainer_feedback_applied: int = 0
 
 class DynamicTips:
 
@@ -915,7 +1068,8 @@ class DynamicTips:
     def generate_tips(self, transcript: str,
                       sop_document: Optional[Dict[str, Any]] = None,
                       learner_instruction: Optional[Dict[str, Any]] = None,
-                      coaching: bool = False) -> Tuple[str, str | None, str]:
+                      coaching: bool = False,
+                      trainer_feedback: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, str | None, str]:
         """Return (tips, error, model that answered)."""
         model_used = GEMINI_MODEL
         framing = COACHING_FRAMING if coaching else ROLEPLAY_FRAMING
@@ -950,6 +1104,7 @@ class DynamicTips:
             You are a communication coach helping learners in Singapore improve their interpersonal effectiveness.
             {sop_instruction}
             {learner_instruction_block(learner_instruction)}
+            {trainer_feedback_block(trainer_feedback or [])}
             {framing['intro']}
             {transcript}
 
@@ -1006,7 +1161,8 @@ class DynamicTips:
                              learner_instruction: Optional[Dict[str, Any]] = None,
                              anchor: Optional[Dict[str, Any]] = None,
                              last_transcript_id: Any = None,
-                             is_requested: bool = False) -> List[ObjectId]:
+                             is_requested: bool = False,
+                             trainer_feedback_ids: Optional[List[Any]] = None) -> List[ObjectId]:
         """Append the tips to the simulation's document; the new tips' ids, or [] on failure."""
         try:
             timestamp   = datetime.now()
@@ -1021,7 +1177,8 @@ class DynamicTips:
                             "sop_applied": sop_applied,
                             **cl_provenance(learner_instruction),
                             **(anchor or {}),
-                            FIELD_LAST_TRANSCRIPT_ID: last_transcript_id} for tip in tips]
+                            FIELD_LAST_TRANSCRIPT_ID: last_transcript_id,
+                            FIELD_TRAINER_FEEDBACK_IDS: list(trainer_feedback_ids or [])} for tip in tips]
 
             simulation_oid = ObjectId(simulation_id)
             result = tips_collection.update_one(
@@ -1085,12 +1242,15 @@ class DynamicTips:
         sop_document = None
         sop_file_url = None
         learner_instruction = None
+        trainer_feedback: List[Dict[str, Any]] = []
         if simulation:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 instruction_future = pool.submit(get_learner_instruction, simulation)
                 sop_future         = pool.submit(resolve_sop_document, simulation_id, simulation)
+                feedback_future    = pool.submit(get_trainer_feedback, simulation)
                 learner_instruction        = instruction_future.result()
                 sop_file_url, sop_document = sop_future.result()
+                trainer_feedback           = feedback_future.result()
             if learner_instruction:
                 print(f"CL instruction for simulation {simulation_id}: {learner_instruction.get('stage')} v{learner_instruction.get('version')}")
         else:
@@ -1100,7 +1260,8 @@ class DynamicTips:
 
         combined, learner_messages = self.combine_transcripts(transcripts)
         coaching = is_coaching_session(simulation, transcripts)
-        tips, error, model_used = self.generate_tips(combined, sop_document, learner_instruction, coaching)
+        tips, error, model_used = self.generate_tips(combined, sop_document, learner_instruction, coaching,
+                                                     trainer_feedback)
         lap("gemini")
 
         anchor: Dict[str, Any] = {}
@@ -1118,6 +1279,7 @@ class DynamicTips:
                 anchor=anchor,
                 last_transcript_id=transcripts[-1].get("_id"),
                 is_requested=is_requested,
+                trainer_feedback_ids=[item["id"] for item in trainer_feedback],
             )
         saved = bool(tip_ids)
         if saved and learner_instruction:
@@ -1133,7 +1295,8 @@ class DynamicTips:
               f"gemini={timings['gemini']} save={timings['save']}) "
               f"transcripts={len(transcripts)} sop={bool(sop_document)} cl={bool(learner_instruction)} "
               f"model={model_used} thinking_budget={GEMINI_THINKING_BUDGET} "
-              f"anchor={anchor.get(FIELD_ANCHOR_METHOD)} requested={is_requested}"
+              f"anchor={anchor.get(FIELD_ANCHOR_METHOD)} requested={is_requested} "
+              f"trainer_feedback={len(trainer_feedback)}"
               + (f" error={error}" if error else ""))
 
         return {
@@ -1153,6 +1316,7 @@ class DynamicTips:
             "anchor_quote":     anchor.get(FIELD_ANCHOR_QUOTE),
             "anchor_method":    anchor.get(FIELD_ANCHOR_METHOD),
             "is_requested":     is_requested,
+            "trainer_feedback_applied": len(trainer_feedback),
         }
 
 advisor = DynamicTips()

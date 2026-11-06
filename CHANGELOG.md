@@ -2,6 +2,10 @@
 
 ## 2026-11-06
 
+### Added
+- Each tip follows trainer feedback on the learner's earlier attempts at the same scenario: tips the trainer rewrote or removed, comments on tips and comments on transcript lines, newest first, at most `TRAINER_FEEDBACK_MAX_ITEMS` (10); the learner's own edits and comments are not counted (task 295)
+- `trainer_feedback_ids` on each stored tip entry and `trainer_feedback_applied` on the `/tips` response; the timing log line gains `trainer_feedback=`
+
 ### Changed
 - Gemini and OpenAI are asked at the same time and the first tip back wins (`TIPS_HEDGE_SECONDS` default 0, was 3 s) (task 681)
 - SOP files stay cached for 30 min (`SOP_CACHE_TTL_SECONDS`, was 10 min) (task 681)
