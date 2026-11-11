@@ -863,6 +863,123 @@ SPELLING_RULE = (
     "only place that keeps their exact spelling."
 )
 
+# ============================================================================
+# Non-verbal behaviour (task 531). Umbra's camera tracking (CORE engine, live on
+# production 2026-11-10) measures each learner message:
+#   user_behaviour {window_duration_ms, face_visible_duration_ms,
+#                   eye_contact_duration_ms, looking_away_duration_ms,
+#                   head_down_duration_ms, eyes_closed_duration_ms,
+#                   smile_duration_ms, nod_count, head_shake_count}
+#   user_emotion   {emotion, confidence, intensity}
+# Where (and whether) the platform saves these on a transcript line is not
+# confirmed yet, so each is looked up under its likely names, top level first,
+# then inside a nested object. A line with nothing usable gets no tag and reads
+# exactly as before, so this does nothing until the data is there.
+# ============================================================================
+NONVERBAL_BEHAVIOUR_KEYS = ("user_behaviour", "user_behavior", "behaviour", "behavior")
+NONVERBAL_EMOTION_KEYS = ("user_emotion", "emotion")
+NONVERBAL_NESTED_KEYS = ("metadata", "meta", "nonverbal", "non_verbal")
+BEHAVIOUR_WINDOW_MS = "window_duration_ms"
+BEHAVIOUR_FACE_VISIBLE_MS = "face_visible_duration_ms"
+BEHAVIOUR_EYE_CONTACT_MS = "eye_contact_duration_ms"
+BEHAVIOUR_SMILE_MS = "smile_duration_ms"
+BEHAVIOUR_NOD_COUNT = "nod_count"
+# Shown only when non-zero: (field, label).
+BEHAVIOUR_OPTIONAL_SHARES = (
+    ("looking_away_duration_ms", "looked away"),
+    ("head_down_duration_ms", "head down"),
+    ("eyes_closed_duration_ms", "eyes closed"),
+)
+BEHAVIOUR_OPTIONAL_COUNTS = (("head_shake_count", "shook head"),)
+EMOTION_LABEL = "emotion"
+EMOTION_CONFIDENCE = "confidence"
+EMOTION_MIN_CONFIDENCE = 0.5
+NONVERBAL_TAG_NAME = "camera"
+
+CAMERA_TAG_RULE = (
+    "A HUMAN USER message may carry a [camera: ...] tag measured by the learner's webcam during that "
+    "message (face visible, eye contact, looking away, head down, eyes closed, smiling, nodding, head "
+    "shakes, how they seemed). The tip may be about it, described in plain words: never quote the tag, "
+    "and never copy it into the ANCHOR line. Camera detection can miss things, so a zero only counts "
+    "when their face was visible for most of that message. A message without a tag was not recorded: "
+    "never comment on the learner's smiling, nodding or eye contact in it."
+)
+
+
+def _nonverbal_field(transcript, keys):
+    """The first non-empty value under one of `keys`, top level first."""
+    places = [transcript] + [transcript.get(key) for key in NONVERBAL_NESTED_KEYS]
+    for place in places:
+        if not isinstance(place, dict):
+            continue
+        for key in keys:
+            if place.get(key) not in (None, "", {}):
+                return place[key]
+    return None
+
+
+def _amount(value):
+    """A non-negative number, or None (booleans and text are not amounts)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value >= 0 else None
+
+
+def _share(behaviour, field, window_ms):
+    """`field` as a whole-number percentage of the message's window, or None."""
+    amount = _amount(behaviour.get(field))
+    if amount is None:
+        return None
+    return min(100, round(100 * amount / window_ms))
+
+
+def _behaviour_parts(behaviour):
+    if not isinstance(behaviour, dict):
+        return []
+    window_ms = _amount(behaviour.get(BEHAVIOUR_WINDOW_MS))
+    if not window_ms:
+        return []
+    parts = []
+    face = _share(behaviour, BEHAVIOUR_FACE_VISIBLE_MS, window_ms)
+    if face is not None:
+        parts.append(f"face visible {face}%")
+    eye_contact = _share(behaviour, BEHAVIOUR_EYE_CONTACT_MS, window_ms)
+    if eye_contact is not None:
+        parts.append(f"eye contact {eye_contact}%")
+    for field, label in BEHAVIOUR_OPTIONAL_SHARES:
+        share = _share(behaviour, field, window_ms)
+        if share:
+            parts.append(f"{label} {share}%")
+    smile_ms = _amount(behaviour.get(BEHAVIOUR_SMILE_MS))
+    if smile_ms is not None:
+        parts.append(f"smiled {smile_ms / 1000:.1f}s" if smile_ms else "no smile")
+    nods = _amount(behaviour.get(BEHAVIOUR_NOD_COUNT))
+    if nods is not None:
+        parts.append(f"nodded {int(nods)}x" if nods else "no nod")
+    for field, label in BEHAVIOUR_OPTIONAL_COUNTS:
+        count = _amount(behaviour.get(field))
+        if count:
+            parts.append(f"{label} {int(count)}x")
+    return parts
+
+
+def _emotion_parts(emotion):
+    if isinstance(emotion, dict):
+        confidence = _amount(emotion.get(EMOTION_CONFIDENCE))
+        if confidence is not None and confidence < EMOTION_MIN_CONFIDENCE:
+            return []
+        emotion = emotion.get(EMOTION_LABEL)
+    if not isinstance(emotion, str) or not emotion.strip():
+        return []
+    return [f"seemed {emotion.strip().lower()}"]
+
+
+def nonverbal_tag(transcript):
+    """' [camera: face visible 100%, eye contact 97%, …]' for a learner line, or ''."""
+    parts = _behaviour_parts(_nonverbal_field(transcript, NONVERBAL_BEHAVIOUR_KEYS))
+    parts += _emotion_parts(_nonverbal_field(transcript, NONVERBAL_EMOTION_KEYS))
+    return f" [{NONVERBAL_TAG_NAME}: {', '.join(parts)}]" if parts else ""
+
 
 def excerpt_words(excerpt: Optional[str]) -> List[str]:
     return (excerpt or "").translate(QUOTE_FOLD_TABLE).strip(QUOTE_EDGE_CHARS).split()
@@ -1070,7 +1187,7 @@ class DynamicTips:
             if from_type == FROM_TYPE_USER:
                 label = learner_label(len(learner_messages) + 1)
                 learner_messages[label] = transcript
-                lines.append(f"[{label}] {SPEAKER_USER}: {text}\n")
+                lines.append(f"[{label}] {SPEAKER_USER}{nonverbal_tag(transcript)}: {text}\n")
             elif from_type == FROM_TYPE_CHARACTER:
                 lines.append(f"{SPEAKER_CHARACTER}: {text}\n")
             elif from_type == FROM_TYPE_COACH:
@@ -1114,7 +1231,7 @@ class DynamicTips:
             - State what the SOP requires, using its own wording where it helps.
             - Give the learner the specific phrasing or action the SOP calls for.
             - Ignore any part of the SOP the conversation gave them no occasion to apply.
-            - Ignore SOP instructions about behaviour that can only be seen or heard (smiling, nodding, eye contact, tone): the transcript cannot show it.
+            - For SOP instructions about smiling, nodding or eye contact, go only by the [camera: ...] tags; with no tag, ignore them. Always ignore instructions about tone of voice: nothing records it.
             - If they followed the SOP throughout, fall back to a general communication tip.
             """
 
@@ -1141,6 +1258,7 @@ class DynamicTips:
 
             {framing['focus']}
             {SPELLING_RULE}
+            {CAMERA_TAG_RULE}
             {framing['ignore']}
             Do NOT add any preamble, heading, or closing text outside the tip blocks.
             Always keep each tip length to 500 characters or less.

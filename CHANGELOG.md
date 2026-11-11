@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-11
+
+### Added
+- A learner message carrying Umbra's camera data (`user_behaviour`, `user_emotion`) gets a `[camera: …]` tag in the prompt (eye contact, smiling, nods, emotion and more), and a tip may be about it; messages without it read as before (task 531)
+
+### Changed
+- SOP instructions about smiling, nodding or eye contact are followed through the camera tag and still skipped without one; tone instructions are always skipped (task 531)
+
 ## 2026-11-06
 
 ### Added
