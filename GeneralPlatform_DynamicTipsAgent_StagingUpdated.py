@@ -456,6 +456,10 @@ FEEDBACK_TIP_EDIT     = "tip_edit"       # an earlier tip, rewritten by the trai
 FEEDBACK_TIP_DELETE   = "tip_delete"     # an earlier tip the trainer removed
 
 FIELD_TRAINER_FEEDBACK_IDS = "trainer_feedback_ids"
+# How long the tip took (request to just before saving) and which AI model
+# wrote it, saved on the tip so agent speed can be read without Render logs (task 686).
+FIELD_DURATION_MS = "duration_ms"
+FIELD_MODEL = "model"
 
 
 def id_variants(value: Any) -> List[Any]:
@@ -1299,7 +1303,9 @@ class DynamicTips:
                              anchor: Optional[Dict[str, Any]] = None,
                              last_transcript_id: Any = None,
                              is_requested: bool = False,
-                             trainer_feedback_ids: Optional[List[Any]] = None) -> List[ObjectId]:
+                             trainer_feedback_ids: Optional[List[Any]] = None,
+                             duration_ms: Optional[int] = None,
+                             model: Optional[str] = None) -> List[ObjectId]:
         """Append the tips to the simulation's document; the new tips' ids, or [] on failure."""
         try:
             timestamp   = datetime.now()
@@ -1315,7 +1321,9 @@ class DynamicTips:
                             **cl_provenance(learner_instruction),
                             **(anchor or {}),
                             FIELD_LAST_TRANSCRIPT_ID: last_transcript_id,
-                            FIELD_TRAINER_FEEDBACK_IDS: list(trainer_feedback_ids or [])} for tip in tips]
+                            FIELD_TRAINER_FEEDBACK_IDS: list(trainer_feedback_ids or []),
+                            FIELD_DURATION_MS: duration_ms,
+                            FIELD_MODEL: model} for tip in tips]
 
             simulation_oid = ObjectId(simulation_id)
             result = tips_collection.update_one(
@@ -1417,6 +1425,8 @@ class DynamicTips:
                 last_transcript_id=transcripts[-1].get("_id"),
                 is_requested=is_requested,
                 trainer_feedback_ids=[item["id"] for item in trainer_feedback],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                model=model_used,
             )
         saved = bool(tip_ids)
         if saved and learner_instruction:

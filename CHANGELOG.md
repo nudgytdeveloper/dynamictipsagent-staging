@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-16
+
+### Added
+- Each saved tip carries `duration_ms` and `model` (task 686)
+
 ## 2026-11-11
 
 ### Added
