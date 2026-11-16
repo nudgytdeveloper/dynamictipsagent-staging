@@ -1,4 +1,6 @@
 import base64
+import json
+import urllib.parse
 import difflib
 import pymongo
 from google import genai
@@ -354,8 +356,71 @@ CL_ABSENT_BLOCK = """
             """
 
 
+# Where the learner's brief is read from (task 686). "mongo" is the CL agent's own
+# collection, as before. "orchestrator" asks the central hub instead, so this agent
+# neither reads nor writes the CL agent's collections: the CL agent sees a brief was
+# used from the `cl_instruction_id` saved on this agent's output.
+CL_BRIEF_SOURCE_MONGO = "mongo"
+CL_BRIEF_SOURCE_ORCHESTRATOR = "orchestrator"
+CL_BRIEF_SOURCE = os.environ.get("CL_BRIEF_SOURCE", CL_BRIEF_SOURCE_MONGO).strip().lower()
+CL_ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "").strip().rstrip("/")
+CL_ORCHESTRATOR_API_KEY = os.environ.get("ORCHESTRATOR_API_KEY", "").strip()
+CL_BRIEF_PATH = "/v1/continuous-learning/learners/{learner_id}/brief"
+CL_BRIEF_TIMEOUT_SECONDS = 3
+CL_DOC_FROM_ORCHESTRATOR = "_from_orchestrator"
+if CL_BRIEF_SOURCE not in (CL_BRIEF_SOURCE_MONGO, CL_BRIEF_SOURCE_ORCHESTRATOR):
+    raise RuntimeError(f"CL_BRIEF_SOURCE must be {CL_BRIEF_SOURCE_MONGO} or {CL_BRIEF_SOURCE_ORCHESTRATOR} (got {CL_BRIEF_SOURCE!r})")
+if CL_BRIEF_SOURCE == CL_BRIEF_SOURCE_ORCHESTRATOR and not CL_ORCHESTRATOR_URL:
+    raise RuntimeError("CL_BRIEF_SOURCE=orchestrator needs ORCHESTRATOR_URL")
+
+
+def _simulation_learner_id(simulation):
+    return next((simulation.get(k) for k in CL_SIM_LEARNER_KEYS if simulation and simulation.get(k) is not None), None)
+
+
+def brief_doc_from_orchestrator(body):
+    """The orchestrator's brief read, in the shape of a CL instruction document; None when it holds no brief."""
+    brief = body.get("brief") if isinstance(body, dict) else None
+    if not isinstance(brief, dict) or not brief.get("instruction") or not brief.get("instruction_id"):
+        return None
+    try:
+        instruction_id = ObjectId(str(brief["instruction_id"]))  # the type the CL agent's own document carries
+    except Exception:
+        instruction_id = brief["instruction_id"]
+    return {"_id": instruction_id, "instruction": brief["instruction"],
+            "per_agent": {CL_AGENT_NAME: brief.get("hint") or ""},
+            "version": brief.get("version"), "stage": brief.get("stage"), "status": brief.get("status"),
+            "for_service_level": brief.get("service_level"), CL_DOC_FROM_ORCHESTRATOR: True}
+
+
+def get_learner_instruction_from_orchestrator(simulation):
+    """The learner's active brief as the orchestrator serves it, or None. Never raises."""
+    try:
+        learner_id = _simulation_learner_id(simulation)
+        if learner_id is None:
+            return None
+        query = {"agent": CL_AGENT_NAME}
+        if simulation.get("service_level") is not None:
+            query["service_level"] = str(simulation.get("service_level"))
+        url = (CL_ORCHESTRATOR_URL + CL_BRIEF_PATH.format(learner_id=urllib.parse.quote(str(learner_id), safe=""))
+               + "?" + urllib.parse.urlencode(query))
+        request = urllib.request.Request(url, headers={"x-api-key": CL_ORCHESTRATOR_API_KEY})
+        with urllib.request.urlopen(request, timeout=CL_BRIEF_TIMEOUT_SECONDS) as response:
+            return brief_doc_from_orchestrator(json.loads(response.read().decode("utf-8")))
+    except Exception as e:
+        print(f"[DEBUG] CL brief read from orchestrator failed: {e}")
+        return None
+
+
 def get_learner_instruction(simulation):
     """Active Continuous-Learning instruction for this simulation's learner, or None. Never raises."""
+    if CL_BRIEF_SOURCE == CL_BRIEF_SOURCE_ORCHESTRATOR:
+        return get_learner_instruction_from_orchestrator(simulation)
+    return get_learner_instruction_from_mongo(simulation)
+
+
+def get_learner_instruction_from_mongo(simulation):
+    """The learner's active brief read from the CL agent's collection, or None. Never raises."""
     try:
         learner_id = next((simulation.get(k) for k in CL_SIM_LEARNER_KEYS if simulation and simulation.get(k) is not None), None)
         if learner_id is None:
@@ -400,8 +465,8 @@ def cl_provenance(doc):
 
 def cl_mark_applied(doc, simulation_id):
     """Audit trail: this agent used the instruction for this simulation. Never raises."""
-    if not doc:
-        return
+    if not doc or doc.get(CL_DOC_FROM_ORCHESTRATOR):
+        return  # read from the orchestrator: the CL agent marks use itself, from this agent's output
     try:
         now = datetime.now(timezone.utc)
         db[CL_INSTRUCTIONS_COLLECTION].update_one({"_id": doc["_id"], "applied_at": None}, {"$set": {"applied_at": now}})

@@ -3,6 +3,7 @@
 ## 2026-11-16
 
 ### Added
+- `CL_BRIEF_SOURCE=orchestrator` reads the learner brief from the orchestrator instead of the CL agent's collection and stops writing to it; default `mongo` is unchanged (task 686)
 - Each saved tip carries `duration_ms` and `model` (task 686)
 
 ## 2026-11-11
