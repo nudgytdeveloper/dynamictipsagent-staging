@@ -932,7 +932,9 @@ SPEAKER_RULE = (
     "Lines not marked HUMAN USER are the AI's words, shown only so you can follow the conversation. "
     "\"You\" in the tip always means the HUMAN USER. Never quote an AI line, and never describe what the AI "
     "said, felt or how it spoke as something the learner did. If the AI sounds stressed, informal, curt or "
-    "unengaged, that is how the scenario wrote it, not something to coach."
+    "unengaged, that is how the scenario wrote it, not something to coach. Speak to the learner as \"you\" "
+    "and call the AI \"the other person\" (\"your coach\" in a coaching session); never write the labels "
+    "HUMAN USER, AI CHARACTER or AI COACH, or the word \"learner\", in the tip."
 )
 
 # Learners type fast; a dropped letter is not a communication problem, and
@@ -1181,6 +1183,26 @@ def resolve_anchor(tip_text: str, label: Optional[str], excerpt: Optional[str],
 # checked, and a phrase found in an AI line but in no learner line gets the tip
 # asked for once more. A second such tip is dropped rather than shown.
 # ============================================================================
+# The prompt's speaker labels are not words for the learner to read (2026-11-18:
+# a production tip said "Your response to the AI CHARACTER's feelings"). The
+# prompt forbids them; any that slip through are put in plain words.
+SPEAKER_LABEL_WORDING = (
+    (re.compile(r'(?<!\w)(the\s+)?"?HUMAN USER"?\'s\b', re.IGNORECASE), "your"),
+    (re.compile(r'(?<!\w)(the\s+)?"?HUMAN USER"?', re.IGNORECASE), "you"),
+    (re.compile(r'(?<!\w)(the\s+)?"?AI CHARACTER"?', re.IGNORECASE), "the other person"),
+    (re.compile(r'(?<!\w)(the\s+)?"?AI COACH"?', re.IGNORECASE), "your coach"),
+)
+
+
+def plain_speaker_names(tip_text: str) -> str:
+    """The tip with any prompt speaker label replaced by plain wording."""
+    for pattern, wording in SPEAKER_LABEL_WORDING:
+        tip_text = pattern.sub(
+            lambda m: wording[0].upper() + wording[1:] if m.group(0)[0].isupper() and m.group(1) else wording,
+            tip_text)
+    return tip_text
+
+
 SUGGESTION_MARKER = "✅"
 ERROR_TIP_QUOTED_AI = "Both tips generated quoted the AI's words as the learner's; no tip was saved."
 
@@ -1523,7 +1545,8 @@ class DynamicTips:
                                                         trainer_feedback, retry_note)
             if not text:
                 return "", None, None, gen_error, model
-            return (*split_anchor_line(text), gen_error, model)
+            tip, label, excerpt = split_anchor_line(text)
+            return plain_speaker_names(tip), label, excerpt, gen_error, model
 
         tips, label, excerpt, error, model_used = generate()
         quoted_ai = ai_only_quotes(tips, learner_texts, ai_texts)

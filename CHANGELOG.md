@@ -4,6 +4,7 @@
 
 ### Fixed
 - Tips no longer coach the AI character's lines as if the learner said them: the prompt says AI lines are context only, and a tip whose observation quotes words only the AI said is asked for once more, then dropped with an error if it still does
+- Tips speak to the learner as "you" and call the AI "the other person" ("your coach" in coaching); the prompt's speaker labels (HUMAN USER, AI CHARACTER, AI COACH) never reach the learner
 
 ## 2026-11-16
 
