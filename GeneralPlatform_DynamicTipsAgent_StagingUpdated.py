@@ -924,6 +924,17 @@ COACHING_FRAMING = {
     "ignore": "Do NOT evaluate the \"AI COACH\" messages.",
 }
 
+# 2026-11-18: an MSF tip told the learner "you expressed your feelings about
+# losing your job with phrases like 'quite sian lah'", the character's words.
+# The transcript's speakers were right; the model coached the character, who is
+# written stressed or curt and so gives it more to comment on than the learner.
+SPEAKER_RULE = (
+    "Lines not marked HUMAN USER are the AI's words, shown only so you can follow the conversation. "
+    "\"You\" in the tip always means the HUMAN USER. Never quote an AI line, and never describe what the AI "
+    "said, felt or how it spoke as something the learner did. If the AI sounds stressed, informal, curt or "
+    "unengaged, that is how the scenario wrote it, not something to coach."
+)
+
 # Learners type fast; a dropped letter is not a communication problem, and
 # quoting one back reads as mockery (task 680: "onestly ... people stae at me").
 SPELLING_RULE = (
@@ -1163,6 +1174,33 @@ def resolve_anchor(tip_text: str, label: Optional[str], excerpt: Optional[str],
     return anchor(list(learner_messages.values())[-1], ANCHOR_METHOD_LATEST, None)
 
 
+# ============================================================================
+# Tips that quote the AI (2026-11-18, see SPEAKER_RULE). On staging 15 of 256
+# quotes in recent tips were the AI's words, so the prompt rule alone is not
+# trusted: the part of a tip before ✅ (what was noticed and why it matters) is
+# checked, and a phrase found in an AI line but in no learner line gets the tip
+# asked for once more. A second such tip is dropped rather than shown.
+# ============================================================================
+SUGGESTION_MARKER = "✅"
+ERROR_TIP_QUOTED_AI = "Both tips generated quoted the AI's words as the learner's; no tip was saved."
+
+
+def ai_quote_retry_note(phrase: str) -> str:
+    return (f'Your previous answer quoted "{phrase}", which the AI said, not the learner. Write a new tip '
+            "about the HUMAN USER's own messages and quote only words from them.")
+
+
+def ai_only_quotes(tip_text: str, learner_texts: List[str], ai_texts: List[str]) -> List[str]:
+    """Phrases the tip's observation quotes that appear in an AI line and in no learner line."""
+    observation = tip_text.split(SUGGESTION_MARKER, 1)[0]
+
+    def said_in(phrase: str, texts: List[str]) -> bool:
+        return any(find_excerpt(phrase, text) for text in texts)
+
+    return [phrase for phrase in quoted_phrases(observation)
+            if said_in(phrase, ai_texts) and not said_in(phrase, learner_texts)]
+
+
 app = FastAPI(title="Dynamic Tips API")
 app.add_middleware(
     CORSMiddleware,
@@ -1273,8 +1311,10 @@ class DynamicTips:
                       sop_document: Optional[Dict[str, Any]] = None,
                       learner_instruction: Optional[Dict[str, Any]] = None,
                       coaching: bool = False,
-                      trainer_feedback: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, str | None, str]:
-        """Return (tips, error, model that answered)."""
+                      trainer_feedback: Optional[List[Dict[str, Any]]] = None,
+                      retry_note: str = "") -> Tuple[str, str | None, str]:
+        """Return (tips, error, model that answered). `retry_note` ends the
+        prompt when an earlier answer has to be corrected."""
         model_used = GEMINI_MODEL
         framing = COACHING_FRAMING if coaching else ROLEPLAY_FRAMING
         try:
@@ -1329,6 +1369,7 @@ class DynamicTips:
             {SPELLING_RULE}
             {CAMERA_TAG_RULE}
             {framing['ignore']}
+            {SPEAKER_RULE}
             Do NOT add any preamble, heading, or closing text outside the tip blocks.
             Always keep each tip length to 500 characters or less.
             {trainer_feedback_reminder(trainer_feedback or [])}
@@ -1336,6 +1377,7 @@ class DynamicTips:
             Each "HUMAN USER" message is labelled [U1], [U2], and so on. Never write these labels in the tip itself.
             After the tip, on its own final line, name the one message the tip is about and copy the exact words from it that you are commenting on, character for character, keeping any spelling mistakes (never correct or reword them):
             ANCHOR: U<number> | "<exact words from that message>"
+            {retry_note}
             """
 
             # A PDF SOP rides along as inline data; a text SOP is already in the prompt.
@@ -1470,13 +1512,30 @@ class DynamicTips:
 
         combined, learner_messages = self.combine_transcripts(transcripts)
         coaching = is_coaching_session(simulation, transcripts)
-        tips, error, model_used = self.generate_tips(combined, sop_document, learner_instruction, coaching,
-                                                     trainer_feedback)
+        learner_texts = [t.get(TRANSCRIPT_TEXT_KEY) or "" for t in transcripts
+                         if t.get(TRANSCRIPT_FROM_TYPE_KEY) == FROM_TYPE_USER]
+        ai_texts = [t.get(TRANSCRIPT_TEXT_KEY) or "" for t in transcripts
+                    if t.get(TRANSCRIPT_FROM_TYPE_KEY) != FROM_TYPE_USER]
+
+        def generate(retry_note: str = "") -> Tuple[str, Optional[str], Optional[str], Optional[str], str]:
+            """(tip without its ANCHOR line, label, excerpt, error, model)."""
+            text, gen_error, model = self.generate_tips(combined, sop_document, learner_instruction, coaching,
+                                                        trainer_feedback, retry_note)
+            if not text:
+                return "", None, None, gen_error, model
+            return (*split_anchor_line(text), gen_error, model)
+
+        tips, label, excerpt, error, model_used = generate()
+        quoted_ai = ai_only_quotes(tips, learner_texts, ai_texts)
+        if quoted_ai:
+            print(f"Tip for simulation {simulation_id} quoted the AI ({quoted_ai[0][:80]!r}); asking again")
+            tips, label, excerpt, error, model_used = generate(ai_quote_retry_note(quoted_ai[0]))
+            if ai_only_quotes(tips, learner_texts, ai_texts):
+                tips, error = "", ERROR_TIP_QUOTED_AI
         lap("gemini")
 
         anchor: Dict[str, Any] = {}
         if tips:
-            tips, label, excerpt = split_anchor_line(tips)
             anchor = resolve_anchor(tips, label, excerpt, learner_messages)
 
         tip_ids: List[ObjectId] = []
@@ -1508,7 +1567,7 @@ class DynamicTips:
               f"transcripts={len(transcripts)} sop={bool(sop_document)} cl={bool(learner_instruction)} "
               f"model={model_used} thinking_budget={GEMINI_THINKING_BUDGET} "
               f"anchor={anchor.get(FIELD_ANCHOR_METHOD)} requested={is_requested} "
-              f"trainer_feedback={len(trainer_feedback)}"
+              f"trainer_feedback={len(trainer_feedback)} ai_quote_retry={bool(quoted_ai)}"
               + (f" error={error}" if error else ""))
 
         return {
